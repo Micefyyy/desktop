@@ -1,0 +1,1 @@
+import{f as e,u as t}from"./index-DQ0k1qz3.js";import{ct as n,en as r}from"./ui-DuiuBgJz.js";import{T as i,v as a}from"./player-DFYjyG5u.js";function o(){return typeof window>`u`?()=>{}:window.linerElectron?.onBundleStamp?.(t=>e(`gray`,`bundle`,t))??(()=>{})}function s(){t(),i(),r(),o(),n(),a()}export{s as initMainWindowServices};
