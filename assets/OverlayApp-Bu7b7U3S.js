@@ -1,0 +1,1 @@
+import{i as e,n as t}from"./index-CfOt6EMi.js";import{M as n,t as r}from"./globals-Bw1Sud-V.js";import{t as i}from"./GlobalTooltip-CxlrFApQ.js";var a=t();function o(){return e()?(0,a.jsxs)(n,{attribute:`data-theme`,defaultTheme:`dark`,enableSystem:!1,forcedTheme:`dark`,children:[(0,a.jsx)(i,{}),(0,a.jsx)(r,{})]}):(window.linerElectron?.closeOverlay?.(),null)}export{o as default};
