@@ -1,104 +1,91 @@
-/* Liner web app service worker.
- * Pre-caches the shell so the PWA opens offline on iOS, then serves hashed
- * build assets cache-first with a background refresh. Cross-origin media,
- * API calls and range requests are never intercepted.
- */
-const VERSION = "v2";
-const PRECACHE = `liner-shell-${VERSION}`;
-const RUNTIME = `liner-assets-${VERSION}`;
+// Serves stored audio to <audio>, which bypasses any fetch shim.
+const DB_NAME = "riff-local";
+const STORE = "files";
 
-const SCOPE = self.registration.scope;
-const APP_SHELL = [
-  "./",
-  "./index.html",
-  "./manifest.webmanifest",
-  "./icons/icon-192.png",
-  "./icons/icon-512.png",
-  "./icons/icon-maskable-512.png",
-  "./icons/apple-touch-icon.png",
-];
+function db() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      if (!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
 
-self.addEventListener("install", (event) => {
-  event.waitUntil(
+async function getRecord(id) {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const req = d.transaction(STORE, "readonly").objectStore(STORE).get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+const MIME = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  opus: "audio/ogg; codecs=opus",
+  flac: "audio/flac",
+  webm: "audio/webm",
+};
+
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) =>
+  e.waitUntil(
     (async () => {
-      const cache = await caches.open(PRECACHE);
-      await Promise.all(
-        APP_SHELL.map((path) =>
-          cache.add(new Request(new URL(path, SCOPE), { cache: "reload" })).catch(() => {}),
-        ),
-      );
-      await self.skipWaiting();
-    })(),
-  );
-});
-
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    (async () => {
+      // drop page caches left by a previous app on this origin (e.g. Liner's sw.js)
       const keys = await caches.keys();
-      await Promise.all(
-        keys
-          .filter((key) => key !== PRECACHE && key !== RUNTIME && key.startsWith("liner-"))
-          .map((key) => caches.delete(key)),
-      );
+      await Promise.all(keys.map((k) => caches.delete(k)));
       await self.clients.claim();
     })(),
-  );
-});
-
-self.addEventListener("message", (event) => {
-  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
-});
-
-function isSameOrigin(url) {
-  return new URL(url).origin === self.location.origin;
-}
-
-async function networkFirst(request) {
-  const cache = await caches.open(PRECACHE);
-  try {
-    // bypass the HTTP cache so a fresh deploy is picked up immediately
-    const response = await fetch(request, { cache: "reload" });
-    if (response.ok) cache.put(request, response.clone()).catch(() => {});
-    return response;
-  } catch (error) {
-    const cached =
-      (await cache.match(request, { ignoreSearch: true })) ||
-      (await cache.match(new URL("./index.html", SCOPE), { ignoreSearch: true }));
-    if (cached) return cached;
-    throw error;
-  }
-}
-
-async function staleWhileRevalidate(request) {
-  const cache = await caches.open(RUNTIME);
-  const cached = await cache.match(request);
-  const network = fetch(request, { cache: "no-cache" })
-    .then((response) => {
-      if (response.ok && response.type === "basic") {
-        cache.put(request, response.clone()).catch(() => {});
-      }
-      return response;
-    })
-    .catch(() => undefined);
-  return cached || (await network) || Response.error();
-}
+  ),
+);
 
 self.addEventListener("fetch", (event) => {
-  const { request } = event;
-  if (request.method !== "GET") return;
-  if (!isSameOrigin(request.url)) return;
-  if (request.headers.has("range")) return;
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin) return;
+  if (!url.pathname.endsWith("/api/local-track") && !url.pathname.endsWith("/api/library-file")) return;
 
-  const url = new URL(request.url);
-  if (url.pathname.endsWith("/sw.js")) return;
+  event.respondWith(
+    (async () => {
+      const id = url.searchParams.get("id");
+      const rec = id ? await getRecord(id.replace(/^local:/, "")) : null;
+      if (!rec || !rec.blob) return new Response("not found", { status: 404 });
 
-  if (request.mode === "navigate") {
-    event.respondWith(networkFirst(request));
-    return;
-  }
+      const blob = rec.blob;
+      const ext = String(rec.name || "").split(".").pop().toLowerCase();
+      const type = rec.type || MIME[ext] || "audio/mpeg";
+      const range = event.request.headers.get("range");
 
-  if (/\.(?:js|css|woff2?|ttf|otf|png|jpe?g|webp|svg|gif|ico|wasm|json|webmanifest)$/i.test(url.pathname)) {
-    event.respondWith(staleWhileRevalidate(request));
-  }
+      if (range) {
+        const m = /bytes=(\d*)-(\d*)/.exec(range);
+        let start = m && m[1] ? parseInt(m[1], 10) : 0;
+        let end = m && m[2] ? parseInt(m[2], 10) : blob.size - 1;
+        if (!Number.isFinite(start) || start < 0) start = 0;
+        if (!Number.isFinite(end) || end >= blob.size) end = blob.size - 1;
+        if (start > end) {
+          return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${blob.size}` } });
+        }
+        return new Response(blob.slice(start, end + 1), {
+          status: 206,
+          headers: {
+            "Content-Type": type,
+            "Content-Range": `bytes ${start}-${end}/${blob.size}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": String(end - start + 1),
+          },
+        });
+      }
+
+      return new Response(blob, {
+        status: 200,
+        headers: { "Content-Type": type, "Accept-Ranges": "bytes", "Content-Length": String(blob.size) },
+      });
+    })(),
+  );
 });

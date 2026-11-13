@@ -1,0 +1,16 @@
+{
+  "name": "Riff",
+  "short_name": "Riff",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#141418",
+  "theme_color": "#141418",
+  "icons": [
+    {
+      "src": "assets/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
