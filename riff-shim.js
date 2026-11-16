@@ -594,10 +594,15 @@
     row.appendChild(time);
 
     row.addEventListener("click", async () => {
-      if (item.closeOnPlay !== false || isNarrowScreen()) closeResults();
+      if (isNarrowScreen() && row.__group) {
+        closeResults();
+        mSetQueue(row.__group, item);
+        mPlayIndex(mState.index);
+        return;
+      }
+      if (item.closeOnPlay !== false) closeResults();
       try {
         await item.onPlay();
-        showMobileNow(`${item.title} · ${item.artist}`);
         if (item.closeOnPlay === false) {
           title.style.color = "#7ee2a8";
           row.style.background = "rgba(126,226,168,.12)";
@@ -634,7 +639,12 @@
       label.textContent = group.label;
       label.style.cssText = "padding:8px 10px 4px;color:#767c88;font-size:11px;letter-spacing:.04em;text-transform:uppercase";
       panel.appendChild(label);
-      group.items.forEach((item) => panel.appendChild(makeRow(item)));
+      group.items.forEach((item) => {
+        const row = makeRow(item);
+        row.__group = group;
+        row.__item = item;
+        panel.appendChild(row);
+      });
       if (group.note) {
         const note = document.createElement("div");
         note.textContent = group.note;
@@ -831,61 +841,207 @@
 
   const isNarrowScreen = () => window.matchMedia("(max-width: 700px)").matches;
 
-  let mobileNow = null;
-  function hideMobileEmpty() {
-    const el = document.getElementById("riff-mobile-empty");
-    if (el) el.remove();
+  // ---- mobile shell: search, results and player, styled after Liner ----
+  const mState = { queue: [], index: -1, el: null, item: null };
+
+  const mFmt = (sec) => {
+    const s = Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : 0;
+    return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  };
+
+  function mEl() {
+    if (mState.el) return mState.el;
+    const remote = window.__riffRemoteAudio;
+    if (remote && remote.src) return remote;
+    return document.querySelector("audio");
   }
 
-  function showMobileNow(text) {
-    if (!isNarrowScreen()) return;
-    mobileNow = text;
-    const el = document.getElementById("riff-mobile-now");
+  function mUpdatePill() {
+    const pill = document.getElementById("riff-mobile-pill");
+    if (!pill) return;
+    if (!mState.item) { pill.style.display = "none"; return; }
+    pill.style.display = "flex";
+    const art = pill.querySelector(".m-art");
+    art.style.backgroundImage = mState.item.art ? 'url("' + mState.item.art + '")' : "none";
+    pill.querySelector(".m-title").textContent = mState.item.title;
+    pill.querySelector(".m-sub").textContent = mState.item.artist || "";
+    const el = mEl();
+    pill.querySelector(".m-toggle").textContent = el && !el.paused ? "\u275A\u275A" : "\u25B6";
+    const fill = document.getElementById("riff-mp-fill");
+    if (fill && el && Number.isFinite(el.duration) && el.duration > 0) {
+      fill.style.width = (el.currentTime / el.duration) * 100 + "%";
+    }
+  }
+
+  function mSyncProgress() {
+    const el = mEl();
     if (!el) return;
-    el.querySelector(".riff-mn-text").textContent = text;
-    el.style.display = "flex";
-    const btn = el.querySelector(".riff-mn-toggle");
-    if (btn) btn.textContent = "\u2016";
+    const fill = document.getElementById("riff-mp-fill");
+    const dur = Number.isFinite(el.duration) ? el.duration : 0;
+    if (fill) fill.style.width = dur ? (el.currentTime / dur) * 100 + "%" : "0%";
+    const cur = document.getElementById("riff-mp-cur");
+    const tot = document.getElementById("riff-mp-dur");
+    if (cur) cur.textContent = mFmt(el.currentTime);
+    if (tot) tot.textContent = dur ? mFmt(dur) : "0:00";
+  }
+
+  function mAttach(el) {
+    if (!el || el.__riffMobileBound) return;
+    el.__riffMobileBound = true;
+    el.addEventListener("timeupdate", mSyncProgress);
+    el.addEventListener("play", mUpdatePill);
+    el.addEventListener("pause", mUpdatePill);
+    el.addEventListener("loadedmetadata", mSyncProgress);
+    el.addEventListener("ended", () => {
+      if (mState.index >= 0 && mState.index < mState.queue.length - 1) mPlayIndex(mState.index + 1);
+      else mUpdatePill();
+    });
+  }
+
+  async function mPlayIndex(i) {
+    const item = mState.queue[i];
+    if (!item) return;
+    mState.index = i;
+    mState.item = item;
+    try {
+      await item.onPlay();
+      mState.el = item.kind === "local" ? document.querySelector("audio") : window.__riffRemoteAudio;
+      mAttach(mState.el);
+      mRenderPlayer();
+      mUpdatePill();
+      mSyncProgress();
+    } catch (e) {
+      showNote('Could not play \u201C' + item.title + '\u201D \u2014 ' + (e && e.message ? e.message : "unknown error") + ".");
+    }
+  }
+
+  function mRenderPlayer() {
+    const p = document.getElementById("riff-mobile-player");
+    if (!p || !mState.item) return;
+    p.querySelector(".mp-art").style.backgroundImage = mState.item.art ? 'url("' + mState.item.art + '")' : "none";
+    p.querySelector(".mp-title").textContent = mState.item.title;
+    p.querySelector(".mp-artist").textContent = mState.item.artist || "";
+    const el = mEl();
+    p.querySelector(".mp-play").textContent = el && !el.paused ? "\u275A\u275A" : "\u25B6";
+    mSyncProgress();
+  }
+
+  // mobile rows carry their group so a tap starts a queue like a playlist
+  function mSetQueue(group, item) {
+    mState.queue = (group && group.items) ? group.items.slice() : [];
+    mState.index = mState.queue.indexOf(item);
+  }
+
+  function toggleMobilePlayer(open) {
+    const p = document.getElementById("riff-mobile-player");
+    if (!p) return;
+    p.style.display = open ? "flex" : "none";
+    if (open) { mRenderPlayer(); closeResults(); }
+  }
+
+  function showMobileNow() {
+    if (!isNarrowScreen()) return;
+    mUpdatePill();
   }
 
   function hideMobileNow() {
-    const el = document.getElementById("riff-mobile-now");
+    const pill = document.getElementById("riff-mobile-pill");
+    if (pill) pill.style.display = "none";
+  }
+
+  function hideMobileEmpty() {
+    const el = document.getElementById("riff-mobile-empty");
     if (el) el.style.display = "none";
+  }
+
+  function showMobileEmpty() {
+    const el = document.getElementById("riff-mobile-empty");
+    if (el && !document.getElementById("riff-web-search")) el.style.display = "flex";
   }
 
   function mountMobileShell() {
     if (!isNarrowScreen()) return;
     if (document.getElementById("riff-mobile-bar")) return;
 
+    const css = [
+      "body.mini .titlebar,body.mini .titlebar-controls,body.mini .playbar{display:none!important}",
+      "#riff-web-add{display:none!important}",
+      "#riff-mobile-bar{position:fixed;top:0;left:0;right:0;z-index:2147483645;padding:calc(10px + env(safe-area-inset-top)) 14px 10px;background:linear-gradient(180deg,#131317 0%,rgba(19,19,23,.86) 70%,rgba(19,19,23,0) 100%)}",
+      "#riff-mobile-bar .m-field{display:flex;align-items:center;gap:10px;height:44px;padding:0 14px;border-radius:14px;background:#232329;border:1px solid rgba(255,255,255,.07)}",
+      "#riff-mobile-bar svg{flex:0 0 auto;opacity:.5}",
+      "#riff-mobile-bar input{flex:1;min-width:0;border:0;background:transparent;color:#f2f2f5;font:500 15px/1 system-ui,-apple-system,sans-serif;outline:none}",
+      "#riff-mobile-bar input::placeholder{color:#7c7c85}",
+      "#riff-mobile-bar .m-add{flex:0 0 auto;width:34px;height:34px;margin-left:2px;border:0;border-radius:10px;background:#2c2c34;color:#e8e8ee;font:600 17px/1 system-ui,sans-serif}",
+      "#riff-mobile-body{position:fixed;top:calc(74px + env(safe-area-inset-top));left:0;right:0;bottom:0;z-index:2147483644;padding:0 4px}",
+      "#riff-mobile-empty{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:14px;padding:0 22px}",
+      "#riff-mobile-empty h1{margin:0;color:#f4f4f7;font:700 26px/1.15 system-ui,-apple-system,sans-serif;letter-spacing:-.02em}",
+      "#riff-mobile-empty p{margin:0;color:#9a9aa4;font:400 14px/1.5 system-ui,-apple-system,sans-serif}",
+      "#riff-mobile-empty .m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}",
+      "#riff-mobile-empty .m-chips button{padding:9px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.06);color:#e9e9ef;font:500 13px/1 system-ui,sans-serif}",
+      "#riff-mobile-pill{position:fixed;left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom));z-index:2147483646;display:none;align-items:center;gap:12px;padding:9px 12px 9px 9px;border-radius:18px;background:rgba(32,32,37,.96);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.5);overflow:hidden}",
+      "#riff-mobile-pill .m-art{flex:0 0 44px;width:44px;height:44px;border-radius:10px;background:#2a2a31 center/cover no-repeat}",
+      "#riff-mobile-pill .m-txt{flex:1;min-width:0}",
+      "#riff-mobile-pill .m-title{display:block;color:#f3f3f7;font:600 14px/1.25 system-ui,-apple-system,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#riff-mobile-pill .m-sub{display:block;color:#95959f;font:400 12px/1.3 system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#riff-mobile-pill button{flex:0 0 auto;width:40px;height:40px;border:0;border-radius:50%;background:#f3f3f7;color:#131317;font:600 14px/1 system-ui,sans-serif}",
+      "#riff-mobile-pill .m-progress{position:absolute;left:0;bottom:0;height:2px;background:#f3f3f7;width:0}",
+      "#riff-mobile-player{position:fixed;inset:0;z-index:2147483647;display:none;flex-direction:column;padding:calc(14px + env(safe-area-inset-top)) 22px calc(24px + env(safe-area-inset-bottom));background:radial-gradient(120% 80% at 50% 0%,#3a2a22 0%,#191519 55%,#0a0a0c 100%);color:#f4f4f7}",
+      "#riff-mobile-player .mp-top{display:flex;align-items:center;justify-content:space-between}",
+      "#riff-mobile-player .mp-close{width:36px;height:36px;border:0;border-radius:50%;background:rgba(255,255,255,.08);color:#e9e9ef;font:600 16px/1 system-ui,sans-serif}",
+      "#riff-mobile-player .mp-label{color:#a9a9b2;font:500 11px/1 system-ui,sans-serif;letter-spacing:.12em;text-transform:uppercase}",
+      "#riff-mobile-player .mp-art{flex:0 0 auto;aspect-ratio:1;width:100%;max-width:330px;margin:26px auto 20px;border-radius:20px;background:#26262c center/cover no-repeat;box-shadow:0 24px 60px rgba(0,0,0,.55)}",
+      "#riff-mobile-player .mp-title{font:700 22px/1.2 system-ui,-apple-system,sans-serif;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#riff-mobile-player .mp-artist{margin-top:6px;color:#a3a3ad;font:400 15px/1.3 system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#riff-mobile-player .mp-bar{position:relative;height:4px;margin:22px 0 6px;border-radius:999px;background:rgba(255,255,255,.16);cursor:pointer}",
+      "#riff-mobile-player .mp-bar .mp-fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:999px;background:#f4f4f7}",
+      "#riff-mobile-player .mp-times{display:flex;justify-content:space-between;color:#91919b;font:500 11px/1 system-ui,sans-serif;font-variant-numeric:tabular-nums}",
+      "#riff-mobile-player .mp-controls{display:flex;align-items:center;justify-content:center;gap:26px;margin-top:26px}",
+      "#riff-mobile-player .mp-controls button{border:0;background:transparent;color:#f4f4f7;font:600 22px/1 system-ui,sans-serif}",
+      "#riff-mobile-player .mp-play{width:64px;height:64px;border-radius:50%!important;background:#f4f4f7!important;color:#131317!important;font-size:20px!important}",
+      "#riff-web-search{top:calc(74px + env(safe-area-inset-top))!important;left:0!important;right:0!important;bottom:86px!important;transform:none!important;width:100%!important;max-height:none!important;border-radius:0!important;border:0!important;background:#131317!important;padding:0 10px 24px!important}",
+      "#riff-web-search>button{padding:9px 10px!important;border-radius:14px!important;gap:12px!important}",
+      "#riff-web-search>button>div:first-child{width:48px!important;height:48px!important;flex:0 0 48px!important;border-radius:10px!important}",
+      "#riff-web-note{left:10px!important;right:10px!important;bottom:90px!important;max-width:none!important;font-size:13px!important}",
+    ].join("\n");
     const style = document.createElement("style");
     style.id = "riff-mobile-css";
-    style.textContent = [
-      "#riff-mobile-bar{position:fixed;top:0;left:0;right:0;height:56px;z-index:2147483645;display:flex;align-items:center;gap:8px;padding:0 10px;background:rgba(18,18,22,.97);border-bottom:1px solid rgba(255,255,255,.08)}",
-      "#riff-mobile-bar input{flex:1;min-width:0;height:38px;padding:0 12px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:#22242c;color:#eceef2;font:500 15px system-ui,sans-serif;outline:none}",
-      "#riff-mobile-bar input:focus{border-color:rgba(255,255,255,.32)}",
-      "#riff-mobile-bar button{flex:0 0 auto;height:38px;min-width:38px;padding:0 10px;border-radius:10px;border:0;background:#333847;color:#eceef2;font:600 15px/1 system-ui,sans-serif}",
-      "#riff-mobile-now{position:fixed;left:0;right:0;bottom:0;z-index:2147483645;display:none;align-items:center;gap:10px;padding:14px 14px calc(14px + env(safe-area-inset-bottom));background:rgba(28,29,36,.98);border-top:1px solid rgba(255,255,255,.1)}",
-      "#riff-mobile-now .riff-mn-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eceef2;font:500 13px system-ui,sans-serif}",
-      "#riff-mobile-now button{flex:0 0 auto;width:34px;height:34px;border-radius:8px;border:0;background:#3d4353;color:#eceef2;font:600 15px system-ui,sans-serif}",
-      "body.mini .titlebar,body.mini .titlebar-controls{display:none!important}",
-      "#riff-mobile-empty{position:fixed;top:56px;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;z-index:2147483644}",
-      "#riff-mobile-empty p{margin:0;color:#8b909b;font:500 14px/1.5 system-ui,sans-serif;max-width:260px}",
-      "#riff-mobile-empty .riff-mchips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:300px}",
-      "#riff-mobile-empty .riff-mchips button{padding:9px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#22242c;color:#dfe2e8;font:500 13px system-ui,sans-serif}",
-      "#riff-web-add{display:none!important}",
-      "#riff-web-note{left:8px!important;right:8px!important;bottom:76px!important;max-width:none!important;font-size:13px!important}",
-      "body.mini .playbar{display:none!important}",
-      "#riff-web-search{top:56px!important;left:0!important;right:0!important;bottom:0!important;transform:none!important;width:100%!important;max-height:none!important;border-radius:0!important;border:0!important}",
-    ].join("\n");
+    style.textContent = css;
     document.head.appendChild(style);
 
     const bar = document.createElement("div");
     bar.id = "riff-mobile-bar";
-    const input = document.createElement("input");
-    input.type = "search";
-    input.placeholder = "Search songs, artists";
-    input.autocomplete = "off";
-    input.setAttribute("enterkeyhint", "search");
+    bar.innerHTML =
+      '<div class="m-field">' +
+      '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>' +
+      '<input type="search" placeholder="Songs, artists, albums" autocomplete="off" enterkeyhint="search">' +
+      "</div>" +
+      '<button class="m-add" type="button" title="Add music">+</button>';
+    const field = bar.querySelector(".m-field");
+    field.style.position = "relative";
+    const input = bar.querySelector("input");
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.textContent = "\u00D7";
+    clear.setAttribute("aria-label", "Clear search");
+    clear.style.cssText =
+      "display:none;flex:0 0 auto;width:26px;height:26px;border:0;border-radius:50%;background:rgba(255,255,255,.14);color:#e9e9ef;font:600 14px/1 system-ui,sans-serif";
+    clear.addEventListener("click", () => {
+      input.value = "";
+      clear.style.display = "none";
+      closeResults();
+      showMobileEmpty();
+      input.focus();
+    });
+    input.addEventListener("input", () => {
+      clear.style.display = input.value ? "block" : "none";
+    });
+    field.appendChild(clear);
+    const addBtn = bar.querySelector(".m-add");
+    field.appendChild(addBtn);
+    addBtn.addEventListener("click", () => {
+      const real = document.getElementById("riff-web-add");
+      if (real) real.click();
+    });
     input.addEventListener("keydown", (e) => {
       if (e.key !== "Enter") return;
       e.preventDefault();
@@ -894,58 +1050,19 @@
       input.blur();
       searchLibrary(q);
     });
-    const add = document.createElement("button");
-    add.type = "button";
-    add.textContent = "+";
-    add.title = "Add music";
-    add.addEventListener("click", () => {
-      const real = document.getElementById("riff-web-add");
-      if (real) real.click();
-    });
-    bar.append(input, add);
     document.body.appendChild(bar);
+    bar.querySelector(".m-add").style.marginLeft = "0";
 
-    const now = document.createElement("div");
-    now.id = "riff-mobile-now";
-    const label = document.createElement("span");
-    label.className = "riff-mn-text";
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "riff-mn-toggle";
-    toggle.textContent = "\u2016";
-    toggle.addEventListener("click", () => {
-      const remote = window.__riffRemoteAudio;
-      const local = document.querySelector("audio");
-      const remoteLive = remote && remote.src && !remote.paused;
-      const target = remoteLive ? remote : local && local.currentTime > 0 ? local : remote || local;
-      if (!target) return;
-      if (target.paused) {
-        if (local && target === remote) { try { local.pause(); } catch {} }
-        target.play().catch(() => {});
-        toggle.textContent = "\u2016";
-      } else {
-        target.pause();
-        toggle.textContent = "\u25B6";
-      }
-    });
-    const stop = document.createElement("button");
-    stop.type = "button";
-    stop.textContent = "\u00D7";
-    stop.title = "Stop";
-    stop.addEventListener("click", () => {
-      const a = window.__riffRemoteAudio;
-      if (a) { a.pause(); a.removeAttribute("src"); }
-      hideMobileNow();
-    });
-    now.append(label, toggle, stop);
-    document.body.appendChild(now);
-
+    const body = document.createElement("div");
+    body.id = "riff-mobile-body";
     const empty = document.createElement("div");
     empty.id = "riff-mobile-empty";
-    const hint = document.createElement("p");
-    hint.textContent = "Search for a song to play it in full. Try one of these:";
+    const h1 = document.createElement("h1");
+    h1.textContent = "Play it in full.";
+    const p = document.createElement("p");
+    p.textContent = "Search any song, artist or album \u2014 tracks stream whole, not as previews.";
     const chips = document.createElement("div");
-    chips.className = "riff-mchips";
+    chips.className = "m-chips";
     for (const term of ["lofi", "jazz", "classical", "hip hop", "grateful dead"]) {
       const chip = document.createElement("button");
       chip.type = "button";
@@ -957,22 +1074,95 @@
       });
       chips.appendChild(chip);
     }
-    empty.append(hint, chips);
-    document.body.appendChild(empty);
+    empty.append(h1, p, chips);
+    body.appendChild(empty);
+    document.body.appendChild(body);
 
-    // keep riff's compact class in sync when the device rotates
-    window.addEventListener("resize", () => {
-      if (!isNarrowScreen()) {
-        bar.remove(); now.remove(); style.remove(); hideMobileNow();
-      } else if (!document.getElementById("riff-mobile-bar")) {
-        mountMobileShell();
-      }
+    const pill = document.createElement("div");
+    pill.id = "riff-mobile-pill";
+    pill.innerHTML =
+      '<div class="m-art"></div>' +
+      '<div class="m-txt"><span class="m-title"></span><span class="m-sub"></span></div>' +
+      '<button class="m-toggle" type="button">\u25B6</button>' +
+      '<div class="m-progress"></div>';
+    pill.querySelector(".m-toggle").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const el = mEl();
+      if (!el) return;
+      if (el.paused) el.play().catch(() => {});
+      else el.pause();
+      mUpdatePill();
     });
+    pill.addEventListener("click", () => toggleMobilePlayer(true));
+    document.body.appendChild(pill);
+
+    const player = document.createElement("div");
+    player.id = "riff-mobile-player";
+    player.innerHTML =
+      '<div class="mp-top"><button class="mp-close" type="button">\u2304</button><span class="mp-label">Now playing</span><span style="width:36px"></span></div>' +
+      '<div class="mp-art"></div>' +
+      '<div class="mp-title"></div>' +
+      '<div class="mp-artist"></div>' +
+      '<div class="mp-bar"><div class="mp-fill" id="riff-mp-fill"></div></div>' +
+      '<div class="mp-times"><span id="riff-mp-cur">0:00</span><span id="riff-mp-dur">0:00</span></div>' +
+      '<div class="mp-controls">' +
+      '<button class="mp-prev" type="button">\u23EE</button>' +
+      '<button class="mp-play" type="button">\u25B6</button>' +
+      '<button class="mp-next" type="button">\u23ED</button>' +
+      "</div>";
+    player.querySelector(".mp-close").addEventListener("click", () => toggleMobilePlayer(false));
+    player.querySelector(".mp-play").addEventListener("click", () => {
+      const el = mEl();
+      if (!el) return;
+      if (el.paused) el.play().catch(() => {});
+      else el.pause();
+      mRenderPlayer();
+      mUpdatePill();
+    });
+    player.querySelector(".mp-prev").addEventListener("click", () => {
+      if (mState.index > 0) mPlayIndex(mState.index - 1);
+      else { const el = mEl(); if (el) el.currentTime = 0; }
+    });
+    player.querySelector(".mp-next").addEventListener("click", () => {
+      if (mState.index >= 0 && mState.index < mState.queue.length - 1) mPlayIndex(mState.index + 1);
+    });
+    player.querySelector(".mp-bar").addEventListener("click", (e) => {
+      const el = mEl();
+      if (!el || !Number.isFinite(el.duration) || !el.duration) return;
+      const r = e.currentTarget.getBoundingClientRect();
+      el.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * el.duration;
+      mSyncProgress();
+    });
+    document.body.appendChild(player);
+
+    // the resize listener that grows/shrinks the shell is bound once in mountHooks
   }
 
   function mountHooks() {
     mountAddButton();
-    mountMobileShell();
+    try {
+      mountMobileShell();
+    } catch (e) {
+      console.warn("[riff] mobile shell failed", e);
+    }
+    if (!window.__riffMobileResizeBound) {
+      window.__riffMobileResizeBound = true;
+      window.addEventListener("resize", () => {
+        if (!isNarrowScreen()) {
+          ["riff-mobile-bar", "riff-mobile-body", "riff-mobile-pill", "riff-mobile-player", "riff-mobile-css"].forEach((id) => {
+            const n = document.getElementById(id);
+            if (n) n.remove();
+          });
+          mState.item = null;
+        } else {
+          try {
+            mountMobileShell();
+          } catch (e) {
+            console.warn("[riff] mobile shell failed", e);
+          }
+        }
+      });
+    }
     // the search field can arrive after DOMContentLoaded on the hosted build
     if (wireSearchBox()) return;
     const timer = setInterval(() => {
