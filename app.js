@@ -5779,6 +5779,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         svg: '<svg width="16" height="16" viewBox="0 0 24 24" fill="#6DD58C"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>'
       };
     }
+    if (p === 'archive') {
+      return {
+        id: 'archive',
+        name: 'Internet Archive',
+        svg: '<svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#1a1a1a"/><path fill="#FFFFFF" d="M5 9.5 12 6l7 3.5v1H5v-1zm1 2.5h2v5H6v-5zm5 0h2v5h-2v-5zm5 0h2v5h-2v-5zM4 18h16v1.6H4V18z"/></svg>'
+      };
+    }
+    if (p === 'audius') {
+      return {
+        id: 'audius',
+        name: 'Audius',
+        svg: '<svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#CC0FE0"/><path fill="#FFFFFF" d="M8 15.5V8.5l8 3.5-8 3.5z"/></svg>'
+      };
+    }
+    if (p === 'itunes') {
+      return {
+        id: 'itunes',
+        name: 'Apple Music preview',
+        svg: '<svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#FA2A55"/><path fill="#FFFFFF" d="M15.6 6.5 9.8 7.9v6.3a2.4 2.4 0 1 0 1.4 2.2V10l3-0.7v3.5a2.4 2.4 0 1 0 1.4 2.2V6.5z"/></svg>'
+      };
+    }
     return {
       id: 'ytmusic',
       name: 'YouTube Music',
@@ -12152,6 +12173,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       let attempts = 0;
       while (attempts < state.queue.length) {
         if (nextIdx >= state.queue.length) {
+          // repeat off stops at the end of the queue instead of wrapping
+          if (state._isNaturalEnding && state.repeatMode !== 'all' && !state.myWaveActive && !state.isRadioQueue && !autoplayEnabled()) {
+            pauseSmooth();
+            updatePlayPauseButton(false, false);
+            return;
+          }
           if (state.myWaveActive && typeof extendMyWaveQueue === 'function') {
             extendMyWaveQueue().then(added => {
               if (added && state.queueIndex + 1 < state.queue.length) {
@@ -20855,10 +20882,36 @@ function bindCoverHoldZoom(wrapEl) {
 
   if (el.btnRepeat) {
     el.btnRepeat.classList.toggle('active', state.isRepeat);
+    const applyRepeatUI = () => {
+      const mode = state.repeatMode || 'off';
+      const btn = el.btnRepeat;
+      if (!btn) return;
+      btn.classList.toggle('active', mode !== 'off');
+      btn.dataset.repeat = mode;
+      btn.title = mode === 'one' ? 'Repeat one' : mode === 'all' ? 'Repeat all' : 'Repeat off';
+      let badge = btn.querySelector('.riff-rep-one');
+      if (mode === 'one') {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'riff-rep-one';
+          badge.textContent = '1';
+          badge.style.cssText = 'position:absolute;right:1px;bottom:-1px;font:700 9px/1 system-ui,sans-serif;pointer-events:none';
+          btn.style.position = 'relative';
+          btn.appendChild(badge);
+        }
+      } else if (badge) {
+        badge.remove();
+      }
+    };
+    state.repeatMode = localStorage.getItem('riff_repeat_mode') || (state.isRepeat ? 'one' : 'off');
+    state.isRepeat = state.repeatMode === 'one';
+    applyRepeatUI();
     el.btnRepeat.addEventListener('click', () => {
-      state.isRepeat = !state.isRepeat;
+      state.repeatMode = state.repeatMode === 'off' ? 'all' : state.repeatMode === 'all' ? 'one' : 'off';
+      state.isRepeat = state.repeatMode === 'one';
+      localStorage.setItem('riff_repeat_mode', state.repeatMode);
       localStorage.setItem('riff_repeat', state.isRepeat ? '1' : '0');
-      el.btnRepeat.classList.toggle('active', state.isRepeat);
+      applyRepeatUI();
     });
   }
 

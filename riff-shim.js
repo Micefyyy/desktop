@@ -189,28 +189,99 @@
       return json({ success: true });
     }
     if (pathname.endsWith("/api/search")) {
-      const needle = String(params.get("q") || "").trim().toLowerCase();
+      // riff's own search UI calls this, so it has to return real, playable tracks
+      const q = String(params.get("q") || "").trim();
       const limit = Math.max(1, parseInt(params.get("limit") || "12", 10));
-      const rows = (await allFiles()) || [];
-      rows.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
-      const tracks = rows
-        .filter((r) => !needle || `${r.title} ${r.artist}`.toLowerCase().includes(needle))
-        .slice(0, limit)
-        .map(trackFrom);
-      return json({ success: true, tracks, hasMore: false });
+      const offset = Math.max(0, parseInt(params.get("offset") || "0", 10));
+      const all = q ? await catalogSearch(q) : await catalogSearch("");
+      const tracks = all.slice(offset, offset + limit);
+      return json({ success: true, tracks, hasMore: offset + tracks.length < all.length });
     }
     if (pathname.endsWith("/api/local-track")) {
       // the service worker serves the bytes; reaching here means the id is unknown
       return json({ success: false, error: "not a local track" }, 404);
     }
     if (pathname.endsWith("/api/stream-info")) {
-      const rec = await getFile(String(params.get("id") || ""));
-      if (!rec) return json({ success: false, error: "not a local track" }, 404);
-      return json({ success: true, platform: "local", isLocal: true, url: trackFrom(rec).url });
+      // riff asks here for the URL it should hand the audio element
+      const id = String(params.get("id") || "");
+      const wantUrl = String(params.get("url") || "");
+      const platform = String(params.get("platform") || "");
+      const rec = id ? await getFile(id) : null;
+      if (rec) return json({ success: true, platform: "local", isLocal: true, url: trackFrom(rec).url, streamUrl: trackFrom(rec).url });
+      if (platform === "audius" && id) {
+        return json({ success: true, platform, isHls: false, streamUrl: audiusStreamUrl(id) });
+      }
+      if (platform === "archive") {
+        const direct = /^https?:\/\//.test(wantUrl) ? wantUrl : null;
+        let resolved = direct;
+        if (!resolved && id) {
+          try { resolved = await archiveAudioUrl(id); } catch { resolved = null; }
+        }
+        if (!resolved) return json({ success: false, error: "that archive item has no playable audio" }, 502);
+        return json({ success: true, platform, isHls: false, streamUrl: resolved });
+      }
+      if (platform === "itunes" && wantUrl) {
+        return json({ success: true, platform, isHls: false, streamUrl: wantUrl });
+      }
+      if (/^https?:\/\//.test(wantUrl)) {
+        return json({ success: true, platform: platform || "direct", isHls: false, streamUrl: wantUrl });
+      }
+      return json({ success: false, error: "this track cannot be streamed here" }, 404);
     }
     if (pathname.endsWith("/api/check-cache")) {
       const rec = await getFile(String(params.get("id") || ""));
       return json(rec ? { cached: true, streamUrl: trackFrom(rec).url } : { cached: false, streamUrl: null });
+    }
+    if (pathname.endsWith("/api/vibe")) {
+      // riff keeps a one-track queue in autoplay mode and asks here for "similar songs"
+      let body = {};
+      try { body = JSON.parse((init && init.body) || "{}"); } catch {}
+      const seeds = Array.isArray(body.seeds) ? body.seeds.filter(Boolean) : [];
+      const avoid = body.avoid || {};
+      const avoidIds = new Set((avoid.ids || []).map((x) => String(x)));
+      const avoidKeys = new Set((avoid.keys || []).map((x) => String(x).toLowerCase()));
+      const avoidArtists = new Set((avoid.artists || []).map((x) => String(x).toLowerCase()));
+      const norm = (a, t) => `${String(a || "").toLowerCase().trim()}::${String(t || "").toLowerCase().trim()}`;
+      const picks = [];
+      const seenKeys = new Set();
+      const add = (t) => {
+        if (!t || !t.title) return;
+        const key = `${String(t.platform || "")}:${t.id || t.url || ""}`;
+        const dk = norm(t.artist, t.title);
+        if (seenKeys.has(key) || seenKeys.has(dk)) return;
+        if (t.id && avoidIds.has(String(t.id))) return;
+        if (avoidKeys.has(dk)) return;
+        if (t.artist && avoidArtists.has(String(t.artist).toLowerCase())) return;
+        seenKeys.add(key);
+        seenKeys.add(dk);
+        picks.push(t);
+      };
+      for (const s of seeds) add(s);
+
+      const wanted = Math.max(6, Math.min(20, Number(body.limit) || 15));
+      const queries = [];
+      const artists = [...new Set(seeds.map((s) => String(s.artist || "").trim()).filter(Boolean))];
+      const titles = [...new Set(seeds.map((s) => String(s.title || "").trim()).filter(Boolean))];
+      for (const a of artists.slice(0, 2)) queries.push(a);
+      for (const t of titles.slice(0, 1)) queries.push(t);
+      if (!queries.length) queries.push("music");
+
+      for (const q of queries) {
+        if (picks.length >= wanted) break;
+        const list = await catalogSearch(q).catch(() => []);
+        for (const t of list) {
+          if (picks.length >= wanted + 2) break;
+          add(t);
+        }
+      }
+      // don't hand back the track that is already playing
+      const seedIds = new Set(seeds.map((s) => String(s.id || "")));
+      const tracks = picks.filter((t) => !(t.id && seedIds.has(String(t.id)))).slice(0, wanted);
+      return json({ success: true, refresh: true, tracks });
+    }
+    if (pathname.includes("/api/download")) {
+      // no yt-dlp or ffmpeg in a browser tab; say so instead of pretending it worked
+      return json({ success: false, error: "Downloads need the desktop app \u2014 the browser version can play but not save files." }, 501);
     }
     if (pathname.endsWith("/api/state")) return json({ success: true });
     if (pathname.endsWith("/api/i18n-batch")) return json({ success: true, translations: {} });
@@ -491,8 +562,8 @@
           const files = (meta.files || []).filter((f) => f && f.private !== "true" && /.(mp3|wav)$/i.test(f.name || ""));
           if (!files.length) return null;
           const score = (f) => (/64kb/i.test(f.name) ? 0 : /.mp3$/i.test(f.name) ? 1 : 2);
-          const urls = files
-            .sort((a, b) => score(a) - score(b))
+          const sorted = files.sort((a, b) => score(a) - score(b));
+          const urls = sorted
             .slice(0, 3)
             .map((f) => `https://archive.org/download/${encodeURIComponent(d.identifier)}/${String(f.name).split("/").map(encodeURIComponent).join("/")}`);
           return {
@@ -500,6 +571,8 @@
             title: Array.isArray(d.title) ? d.title[0] : d.title || d.identifier,
             artist: Array.isArray(d.creator) ? d.creator[0] : d.creator || "Internet Archive",
             urls,
+            thumb: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
+            duration: Math.round(Number(sorted[0] && sorted[0].length) || 0),
           };
         } catch {
           return null;
@@ -553,11 +626,92 @@
             artist: r.artistName,
             art: r.artworkUrl60,
             preview: r.previewUrl,
+            id: String(r.trackId || ""),
+            duration: Math.round((Number(r.trackTimeMillis) || 30000) / 1000),
           }));
       }, 9000);
     } catch {
       return [];
     }
+  }
+
+  // One merged catalogue for riff's own search: full-length sources first, previews last.
+  const catalogCache = new Map();
+  async function catalogSearch(query) {
+    const key = String(query || "").trim().toLowerCase();
+    const hit = catalogCache.get(key);
+    if (hit && Date.now() - hit.at < 120000) return hit.tracks;
+
+    const [archive, audius, apple, rows] = await Promise.all([
+      key ? archiveSearch(query).catch(() => []) : Promise.resolve([]),
+      key ? audiusSearch(query).catch(() => []) : Promise.resolve([]),
+      key ? itunesSearch(query).catch(() => []) : Promise.resolve([]),
+      allFiles().catch(() => []),
+    ]);
+
+    const local = (rows || [])
+      .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
+      .filter((r) => !key || `${r.title} ${r.artist}`.toLowerCase().includes(key))
+      .map((r) => ({
+        id: r.id,
+        platform: "local",
+        title: r.title,
+        artist: r.artist,
+        duration: Number(r.duration) || 0,
+        thumbnail: "",
+      }));
+
+    const tracks = [];
+    const seen = new Set();
+    const push = (t) => {
+      const title = String(t.title || "").trim();
+      if (!title) return;
+      const dk = `${title.toLowerCase()}::${String(t.artist || "").trim().toLowerCase()}`;
+      if (seen.has(dk)) return;
+      seen.add(dk);
+      tracks.push(t);
+    };
+
+    for (const l of local) push(l);
+    for (const a of archive) {
+      push({
+        id: a.identifier,
+        platform: "archive",
+        title: a.title,
+        artist: a.artist,
+        album: "Internet Archive",
+        duration: Number(a.duration) || 0,
+        thumbnail: a.thumb || `https://archive.org/services/img/${encodeURIComponent(a.identifier)}`,
+        url: (a.urls || [])[0] || "",
+      });
+    }
+    for (const t of audius) {
+      push({
+        id: t.id,
+        platform: "audius",
+        title: t.title || "Untitled",
+        artist: (t.user && t.user.name) || "Audius",
+        duration: Number(t.duration) || 0,
+        thumbnail:
+          (t.artwork && (t.artwork["480x480"] || t.artwork["150x150"])) || "",
+      });
+    }
+    for (const a of apple) {
+      push({
+        id: a.id || `${a.title}-${a.artist}`.replace(/\s+/g, "_"),
+        platform: "itunes",
+        title: a.title,
+        artist: a.artist,
+        album: "Apple Music preview",
+        duration: a.duration || 30,
+        thumbnail: a.art,
+        url: a.preview,
+      });
+    }
+
+    catalogCache.set(key, { at: Date.now(), tracks });
+    if (catalogCache.size > 40) catalogCache.delete(catalogCache.keys().next().value);
+    return tracks;
   }
 
   function makeRow(item) {
@@ -725,8 +879,8 @@
     const archiveItems = archive.map((a) => ({
       title: a.title,
       artist: a.artist,
-      time: "full",
-      art: "",
+      time: a.duration ? fmtTime(a.duration) : "full",
+      art: a.thumb || `https://archive.org/services/img/${encodeURIComponent(a.identifier)}`,
       track: { type: "archive", urls: a.urls, title: a.title, artist: a.artist },
       onPlay: async () => {
         const ok = await playFirstPlayable(a.urls || []);
@@ -829,6 +983,7 @@
   function wireSearchBox() {
     const input = document.getElementById("search-input");
     if (!input) return false;
+    if (!isNarrowScreen()) return true; // desktop uses riff's own search and player
     if (input.dataset.riffWebWired) return true;
     input.dataset.riffWebWired = "1";
     input.addEventListener(
