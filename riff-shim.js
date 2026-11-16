@@ -199,6 +199,10 @@
         .map(trackFrom);
       return json({ success: true, tracks, hasMore: false });
     }
+    if (pathname.endsWith("/api/local-track")) {
+      // the service worker serves the bytes; reaching here means the id is unknown
+      return json({ success: false, error: "not a local track" }, 404);
+    }
     if (pathname.endsWith("/api/stream-info")) {
       const rec = await getFile(String(params.get("id") || ""));
       if (!rec) return json({ success: false, error: "not a local track" }, 404);
