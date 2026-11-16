@@ -523,6 +523,13 @@
     document.querySelectorAll("#riff-web-search").forEach((p) => p.remove());
   }
 
+  // never let one slow source leave a search spinning forever
+  const settle = (p, ms, fallback) =>
+    Promise.race([
+      Promise.resolve(p).catch(() => fallback),
+      new Promise((r) => setTimeout(() => r(fallback), ms)),
+    ]);
+
   const withTimeout = async (fn, ms) => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
@@ -555,7 +562,10 @@
       docs.slice(0, 8).map(async (d) => {
         if (!d || !d.identifier) return null;
         try {
-          const meta = await (await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier)}`)).json();
+          const meta = await withTimeout(async (signal) => {
+            const res = await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier)}`, { signal });
+            return res.json();
+          }, 4000);
           // lending-library items keep their audio private, so nothing would ever play
           const md = meta.metadata || {};
           if (md["access-restricted-item"] === "true") return null;
@@ -643,10 +653,10 @@
     if (hit && Date.now() - hit.at < 120000) return hit.tracks;
 
     const [archive, audius, apple, rows] = await Promise.all([
-      key ? archiveSearch(query).catch(() => []) : Promise.resolve([]),
-      key ? audiusSearch(query).catch(() => []) : Promise.resolve([]),
-      key ? itunesSearch(query).catch(() => []) : Promise.resolve([]),
-      allFiles().catch(() => []),
+      key ? settle(archiveSearch(query), 7000, []) : Promise.resolve([]),
+      key ? settle(audiusSearch(query), 7000, []) : Promise.resolve([]),
+      key ? settle(itunesSearch(query), 7000, []) : Promise.resolve([]),
+      settle(allFiles(), 2500, []),
     ]);
 
     const local = (rows || [])
