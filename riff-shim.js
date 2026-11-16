@@ -398,6 +398,36 @@
     return false;
   }
 
+  // OpenTune / BitChord HTTP add-ons: <base>/manifest.json, /search?q=…, /stream/{id}
+  const ADDON_KEY = "riff-addon-root";
+  const DEFAULT_ADDON = "https://opentune-lossless-addon.create-a-new-site-with-sites.workers.dev/monochrome";
+
+  function addonBase() {
+    let raw = DEFAULT_ADDON;
+    try { raw = localStorage.getItem(ADDON_KEY) || DEFAULT_ADDON; } catch {}
+    return raw.replace(/\/manifest\.json$/i, "").replace(/\/+$/, "");
+  }
+
+  async function addonJson(url) {
+    const res = await withTimeout(async (signal) => fetch(url, { signal, headers: { Accept: "application/json" } }), 9000);
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok) throw new Error((body && body.error) || `add-on returned ${res.status}`);
+    if (!body) throw new Error("add-on did not send JSON");
+    return body;
+  }
+
+  async function addonSearch(query) {
+    const body = await addonJson(`${addonBase()}/search?q=${encodeURIComponent(query)}`);
+    return Array.isArray(body.tracks) ? body.tracks : [];
+  }
+
+  async function addonStream(trackId) {
+    const body = await addonJson(`${addonBase()}/stream/${encodeURIComponent(trackId)}`);
+    if (!body.url) throw new Error("add-on sent no audio url");
+    return body.url;
+  }
+
   async function playUrl(url, needsCors) {
     stopRemote();
     const audio = document.querySelector("audio");
@@ -581,12 +611,19 @@
 
     let total = 0;
     for (const group of groups) {
-      if (!group.items.length) continue;
+      if (!group.items.length && !group.note) continue;
       const label = document.createElement("div");
       label.textContent = group.label;
       label.style.cssText = "padding:8px 10px 4px;color:#767c88;font-size:11px;letter-spacing:.04em;text-transform:uppercase";
       panel.appendChild(label);
       group.items.forEach((item) => panel.appendChild(makeRow(item)));
+      if (group.note) {
+        const note = document.createElement("div");
+        note.textContent = group.note;
+        note.style.cssText = "padding:2px 10px 8px;color:#c89aa8;font-size:12px" + (group.onNoteClick ? ";cursor:pointer;text-decoration:underline" : "");
+        if (group.onNoteClick) note.addEventListener("click", group.onNoteClick);
+        panel.appendChild(note);
+      }
       total += group.items.length;
     }
 
@@ -629,7 +666,17 @@
 
     showResults(query, [{ label: `Your files (${rows.length})`, items: localItems }], "Searching…");
 
-    const [archive, apple] = await Promise.all([archiveSearch(query), itunesSearch(query)]);
+    const addonHost = (() => { try { return new URL(addonBase()).host; } catch { return addonBase(); } })();
+    let addonNote = null;
+
+    const [archive, apple, addon] = await Promise.all([
+      archiveSearch(query),
+      itunesSearch(query),
+      addonSearch(query).catch((e) => {
+        addonNote = `OpenTune add-on (${addonHost}): ${e && e.message ? e.message : "unavailable"}`;
+        return [];
+      }),
+    ]);
 
     const archiveItems = archive.map((a) => ({
       title: a.title,
@@ -656,16 +703,40 @@
       closeOnPlay: false,
     }));
 
+    const addonItems = (addon || []).slice(0, 8).map((t) => ({
+      title: t.title || "Untitled",
+      artist: t.artist || "add-on",
+      time: t.duration ? fmtTime(t.duration) : "full",
+      art: t.artwork || "",
+      onPlay: async () => {
+        const url = await addonStream(t.id);
+        const ok = await playFirstPlayable([url]);
+        if (!ok) throw new Error("add-on audio did not start");
+      },
+      closeOnPlay: false,
+    }));
+
     showResults(
       query,
       [
         { label: `Your files (${rows.length})`, items: localItems },
         { label: "Full tracks · Internet Archive", items: archiveItems },
+        {
+          label: `OpenTune add-on · ${addonHost}`,
+          items: addonItems,
+          note: addonNote,
+          onNoteClick: () => {
+            const next = prompt("OpenTune add-on address (manifest.json or base URL):", addonBase());
+            if (!next) return;
+            try { localStorage.setItem(ADDON_KEY, next.trim()); } catch {}
+            showNote("Add-on saved. Search again to use it.");
+          },
+        },
         { label: "Apple Music previews · 30s", items: appleItems },
       ],
       null,
     );
-    return localItems.length + archiveItems.length + appleItems.length;
+    return localItems.length + archiveItems.length + addonItems.length + appleItems.length;
   }
 
   let noteTimer = null;
