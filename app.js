@@ -19022,7 +19022,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
     const totalSec = (pl.tracks || []).reduce((acc, t) => acc + (t.duration || 0), 0);
     const durStr = totalSec > 0 ? ` • ${formatPlaylistDuration(totalSec)}` : '';
     if (el.playlistDetailCount) {
-      el.playlistDetailCount.textContent = (query ? `${filtered.length} of ${pl.tracks.length} tracks` : `${pl.tracks.length} tracks`) + durStr;
+      el.playlistDetailCount.textContent = (query ? `${filtered.length} of ${pl.tracks.length} tracks` : `${pl.tracks.length} track${pl.tracks.length === 1 ? '' : 's'}`) + durStr;
     }
     if (el.playlistTracksList) renderTracks(el.playlistTracksList, filtered, 'playlist');
     renderPlaylistsList();
@@ -19348,7 +19348,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
     }
     const totalSec = (pl.tracks || []).reduce((acc, t) => acc + (t.duration || 0), 0);
     const durStr = totalSec > 0 ? ` • ${formatPlaylistDuration(totalSec)}` : '';
-    if (el.playlistDetailCount) el.playlistDetailCount.textContent = (query ? `${filtered.length} of ${pl.tracks.length} tracks` : `${pl.tracks.length} tracks`) + durStr;
+    if (el.playlistDetailCount) el.playlistDetailCount.textContent = (query ? `${filtered.length} of ${pl.tracks.length} tracks` : `${pl.tracks.length} track${pl.tracks.length === 1 ? '' : 's'}`) + durStr;
     const detailCover = document.getElementById('playlist-detail-cover');
     if (detailCover) {
       renderPlaylistCover(detailCover, pl, 204);
