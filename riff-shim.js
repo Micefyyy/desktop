@@ -679,6 +679,7 @@
         time: fmtTime(rec.duration),
         art: "",
         kind: "local",
+        track: { type: "local", fileId: rec.id, title: rec.title, artist: rec.artist, duration: rec.duration },
         onPlay: async () => {
           stopRemote();
           const el = document.querySelector("audio");
@@ -722,6 +723,7 @@
       artist: a.artist,
       time: "full",
       art: "",
+      track: { type: "archive", urls: a.urls, title: a.title, artist: a.artist },
       onPlay: async () => {
         const ok = await playFirstPlayable(a.urls || []);
         if (!ok) throw new Error("no playable file");
@@ -734,6 +736,14 @@
       artist: (t.user && t.user.name) || "Audius",
       time: t.duration ? fmtTime(t.duration) : "full",
       art: t.artwork && t.artwork["150x150"] ? t.artwork["150x150"] : "",
+      track: {
+        type: "audius",
+        id: t.id,
+        title: t.title || "Untitled",
+        artist: (t.user && t.user.name) || "Audius",
+        art: t.artwork && t.artwork["150x150"] ? t.artwork["150x150"] : "",
+        duration: t.duration,
+      },
       onPlay: async () => {
         const ok = await playFirstPlayable([audiusStreamUrl(t.id)]);
         if (!ok) throw new Error("Audius stream did not start");
@@ -746,6 +756,7 @@
       artist: a.artist,
       time: "0:30",
       art: a.art,
+      track: { type: "apple", preview: a.preview, title: a.title, artist: a.artist, art: a.art, time: "0:30" },
       onPlay: async () => {
         const audio = playRemote(a.preview);
         const ok = await waitForPlayback(audio, 12000);
@@ -959,6 +970,123 @@
     if (el && !document.getElementById("riff-web-search")) el.style.display = "flex";
   }
 
+  // ---- playlists, stored in this browser ----
+  const PL_KEY = "riff-playlists";
+  const loadPlaylists = () => {
+    try {
+      const v = JSON.parse(localStorage.getItem(PL_KEY) || "[]");
+      return Array.isArray(v) ? v : [];
+    } catch {
+      return [];
+    }
+  };
+  const savePlaylists = (list) => {
+    try { localStorage.setItem(PL_KEY, JSON.stringify(list)); } catch {}
+  };
+
+  function itemFromTrack(t) {
+    if (!t || !t.type) return null;
+    const base = {
+      title: t.title || "Untitled",
+      artist: t.artist || "",
+      art: t.art || "",
+      time: t.time || (t.duration ? fmtTime(t.duration) : "full"),
+      kind: "remote",
+      closeOnPlay: false,
+      track: t,
+    };
+    if (t.type === "archive") {
+      return { ...base, onPlay: async () => { if (!(await playFirstPlayable(t.urls || []))) throw new Error("no playable file"); } };
+    }
+    if (t.type === "audius") {
+      return { ...base, onPlay: async () => { if (!(await playFirstPlayable([audiusStreamUrl(t.id)]))) throw new Error("Audius stream did not start"); } };
+    }
+    if (t.type === "apple") {
+      return { ...base, onPlay: async () => { const a = playRemote(t.preview); if (!(await waitForPlayback(a, 12000))) throw new Error("preview did not start"); } };
+    }
+    if (t.type === "local") {
+      return {
+        ...base,
+        kind: "local",
+        onPlay: async () => {
+          const rows = (await allFiles()) || [];
+          const rec = rows.find((r) => r.id === t.fileId);
+          if (!rec) throw new Error("that file is no longer on this device");
+          stopRemote();
+          const el = document.querySelector("audio");
+          if (!el) throw new Error("no player element");
+          el.src = trackFrom(rec).url;
+          el.removeAttribute("crossorigin");
+          el.load();
+          if (typeof window.playSmooth === "function") window.playSmooth();
+          if (!(await waitForPlayback(el, 8000))) throw new Error("your file did not start");
+        },
+      };
+    }
+    return null;
+  }
+
+  function saveTracksToPlaylist(name, tracks) {
+    const clean = (tracks || []).filter(Boolean);
+    if (!clean.length) { showNote("Nothing to save yet — play or search something first."); return; }
+    const list = loadPlaylists();
+    const key = name.trim().toLowerCase();
+    const sig = (t) => [t.type, t.id || t.preview || t.fileId || (t.urls && t.urls[0]) || "", t.title].join("|");
+    const existing = list.find((p) => p.name.trim().toLowerCase() === key);
+    if (existing) {
+      const have = new Set(existing.tracks.map(sig));
+      for (const t of clean) if (!have.has(sig(t))) existing.tracks.push(t);
+    } else {
+      list.push({ id: "pl_" + Date.now().toString(36), name: name.trim(), tracks: clean });
+    }
+    savePlaylists(list);
+    renderPlaylists();
+    showNote("Saved to “" + name.trim() + "”.");
+  }
+
+  function openPlaylist(pl) {
+    const items = (pl.tracks || []).map(itemFromTrack).filter(Boolean);
+    if (!items.length) { showNote("That playlist is empty."); return; }
+    showResults(pl.name, [{ label: pl.name + " · " + items.length + " tracks", items }], pl.name);
+  }
+
+  function renderPlaylists() {
+    const wrap = document.getElementById("riff-mobile-playlists");
+    if (!wrap) return;
+    const list = loadPlaylists();
+    wrap.innerHTML = "";
+    if (!list.length) { wrap.style.display = "none"; return; }
+    wrap.style.display = "block";
+    const h = document.createElement("h2");
+    h.textContent = "Playlists";
+    h.style.cssText = "margin:18px 0 6px;color:#9a9aa4;font:600 11px/1 system-ui,sans-serif;letter-spacing:.12em;text-transform:uppercase";
+    wrap.appendChild(h);
+    for (const pl of list) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:10px;padding:9px 0";
+      const open = document.createElement("button");
+      open.type = "button";
+      open.style.cssText = "flex:1;min-width:0;text-align:left;border:0;background:transparent;color:#f2f2f6;font:600 15px/1.25 system-ui,sans-serif;padding:0";
+      open.textContent = pl.name;
+      const meta = document.createElement("span");
+      meta.textContent = (pl.tracks || []).length + " tracks";
+      meta.style.cssText = "display:block;margin-top:3px;color:#8e8e98;font:400 12px system-ui,sans-serif";
+      open.appendChild(meta);
+      open.addEventListener("click", () => openPlaylist(pl));
+      const del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "\u00D7";
+      del.setAttribute("aria-label", "Delete playlist");
+      del.style.cssText = "flex:0 0 auto;width:30px;height:30px;border:0;border-radius:50%;background:rgba(255,255,255,.08);color:#d8d8e0;font:600 14px/1 system-ui,sans-serif";
+      del.addEventListener("click", () => {
+        savePlaylists(loadPlaylists().filter((p) => p.id !== pl.id));
+        renderPlaylists();
+      });
+      row.append(open, del);
+      wrap.appendChild(row);
+    }
+  }
+
   function mountMobileShell() {
     if (!isNarrowScreen()) return;
     if (document.getElementById("riff-mobile-bar")) return;
@@ -973,7 +1101,7 @@
       "#riff-mobile-bar input::placeholder{color:#7c7c85}",
       "#riff-mobile-bar .m-add{flex:0 0 auto;width:34px;height:34px;margin-left:2px;border:0;border-radius:10px;background:#2c2c34;color:#e8e8ee;font:600 17px/1 system-ui,sans-serif}",
       "#riff-mobile-body{position:fixed;top:calc(74px + env(safe-area-inset-top));left:0;right:0;bottom:0;z-index:2147483644;padding:0 4px}",
-      "#riff-mobile-empty{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:14px;padding:0 22px}",
+      "#riff-mobile-empty{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:14px;padding:0 22px;overflow-y:auto}",
       "#riff-mobile-empty h1{margin:0;color:#f4f4f7;font:700 26px/1.15 system-ui,-apple-system,sans-serif;letter-spacing:-.02em}",
       "#riff-mobile-empty p{margin:0;color:#9a9aa4;font:400 14px/1.5 system-ui,-apple-system,sans-serif}",
       "#riff-mobile-empty .m-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}",
@@ -999,6 +1127,8 @@
       "#riff-mobile-player .mp-controls button{border:0;background:transparent;color:#f4f4f7;font:600 22px/1 system-ui,sans-serif}",
       "#riff-mobile-player .mp-play{width:64px;height:64px;border-radius:50%!important;background:#f4f4f7!important;color:#131317!important;font-size:20px!important}",
       "#riff-web-search{top:calc(74px + env(safe-area-inset-top))!important;left:0!important;right:0!important;bottom:86px!important;transform:none!important;width:100%!important;max-height:none!important;border-radius:0!important;border:0!important;background:#131317!important;padding:0 10px 24px!important}",
+      "#riff-mobile-player .mp-actions{display:flex;gap:10px;justify-content:center;margin-top:22px}",
+      "#riff-mobile-player .mp-actions button{padding:10px 16px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#e9e9ef;font:500 13px/1 system-ui,sans-serif}",
       "#riff-web-search>button{padding:9px 10px!important;border-radius:14px!important;gap:12px!important}",
       "#riff-web-search>button>div:first-child{width:48px!important;height:48px!important;flex:0 0 48px!important;border-radius:10px!important}",
       "#riff-web-note{left:10px!important;right:10px!important;bottom:90px!important;max-width:none!important;font-size:13px!important}",
@@ -1074,9 +1204,13 @@
       });
       chips.appendChild(chip);
     }
-    empty.append(h1, p, chips);
+    const plWrap = document.createElement("div");
+    plWrap.id = "riff-mobile-playlists";
+    plWrap.style.cssText = "display:none;width:100%;max-width:330px;text-align:left";
+    empty.append(h1, p, chips, plWrap);
     body.appendChild(empty);
     document.body.appendChild(body);
+    renderPlaylists();
 
     const pill = document.createElement("div");
     pill.id = "riff-mobile-pill";
@@ -1109,7 +1243,8 @@
       '<button class="mp-prev" type="button">\u23EE</button>' +
       '<button class="mp-play" type="button">\u25B6</button>' +
       '<button class="mp-next" type="button">\u23ED</button>' +
-      "</div>";
+      "</div>" +
+      '<div class="mp-actions"><button class="mp-add" type="button">Add to playlist</button><button class="mp-save" type="button">Save queue</button></div>';
     player.querySelector(".mp-close").addEventListener("click", () => toggleMobilePlayer(false));
     player.querySelector(".mp-play").addEventListener("click", () => {
       const el = mEl();
@@ -1125,6 +1260,17 @@
     });
     player.querySelector(".mp-next").addEventListener("click", () => {
       if (mState.index >= 0 && mState.index < mState.queue.length - 1) mPlayIndex(mState.index + 1);
+    });
+    player.querySelector(".mp-add").addEventListener("click", () => {
+      const t = mState.item && mState.item.track;
+      if (!t) { showNote("Nothing is playing yet."); return; }
+      const name = prompt("Add to which playlist?", "My playlist");
+      if (name && name.trim()) saveTracksToPlaylist(name, [t]);
+    });
+    player.querySelector(".mp-save").addEventListener("click", () => {
+      const tracks = (mState.queue || []).map((it) => it.track).filter(Boolean);
+      const name = prompt("Name this playlist", "My playlist");
+      if (name && name.trim()) saveTracksToPlaylist(name, tracks);
     });
     player.querySelector(".mp-bar").addEventListener("click", (e) => {
       const el = mEl();
