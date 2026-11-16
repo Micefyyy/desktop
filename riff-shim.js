@@ -444,8 +444,8 @@
   }
 
   function closeResults() {
-    const panel = document.getElementById("riff-web-search");
-    if (panel) panel.remove();
+    // more than one panel can be left behind by overlapping searches
+    document.querySelectorAll("#riff-web-search").forEach((p) => p.remove());
   }
 
   const withTimeout = async (fn, ms) => {
@@ -594,9 +594,10 @@
     row.appendChild(time);
 
     row.addEventListener("click", async () => {
-      if (item.closeOnPlay !== false) closeResults();
+      if (item.closeOnPlay !== false || isNarrowScreen()) closeResults();
       try {
         await item.onPlay();
+        showMobileNow(`${item.title} · ${item.artist}`);
         if (item.closeOnPlay === false) {
           title.style.color = "#7ee2a8";
           row.style.background = "rgba(126,226,168,.12)";
@@ -610,6 +611,7 @@
 
   function showResults(query, groups, status) {
     closeResults();
+    hideMobileEmpty();
     const panel = document.createElement("div");
     panel.id = "riff-web-search";
     panel.style.cssText = [
@@ -666,6 +668,7 @@
         artist: rec.artist,
         time: fmtTime(rec.duration),
         art: "",
+        kind: "local",
         onPlay: async () => {
           stopRemote();
           const el = document.querySelector("audio");
@@ -686,10 +689,15 @@
     let addonNote = null;
 
     let audiusNote = null;
+    // only talk to an add-on when the user has actually configured one
+    const addonConfigured = (() => { try { return Boolean(localStorage.getItem(ADDON_KEY)); } catch { return false; } })();
     const [archive, apple, addon, audius] = await Promise.all([
       archiveSearch(query),
       itunesSearch(query),
-      addonSearch(query).catch((e) => {
+      (addonConfigured
+        ? addonSearch(query)
+        : Promise.resolve([])
+      ).catch((e) => {
         addonNote = `OpenTune add-on (${addonHost}): ${e && e.message ? e.message : "unavailable"}`;
         return [];
       }),
@@ -755,7 +763,7 @@
         { label: `Your files (${rows.length})`, items: localItems },
         { label: "Full tracks · Internet Archive", items: archiveItems },
         { label: "Full tracks · Audius", items: audiusItems, note: audiusNote },
-        {
+        ...(addonConfigured ? [{
           label: `OpenTune add-on · ${addonHost}`,
           items: addonItems,
           note: addonNote,
@@ -765,7 +773,7 @@
             try { localStorage.setItem(ADDON_KEY, next.trim()); } catch {}
             showNote("Add-on saved. Search again to use it.");
           },
-        },
+        }] : []),
         { label: "Apple Music previews · 30s", items: appleItems },
       ],
       null,
@@ -821,8 +829,150 @@
     return true;
   }
 
+  const isNarrowScreen = () => window.matchMedia("(max-width: 700px)").matches;
+
+  let mobileNow = null;
+  function hideMobileEmpty() {
+    const el = document.getElementById("riff-mobile-empty");
+    if (el) el.remove();
+  }
+
+  function showMobileNow(text) {
+    if (!isNarrowScreen()) return;
+    mobileNow = text;
+    const el = document.getElementById("riff-mobile-now");
+    if (!el) return;
+    el.querySelector(".riff-mn-text").textContent = text;
+    el.style.display = "flex";
+    const btn = el.querySelector(".riff-mn-toggle");
+    if (btn) btn.textContent = "\u2016";
+  }
+
+  function hideMobileNow() {
+    const el = document.getElementById("riff-mobile-now");
+    if (el) el.style.display = "none";
+  }
+
+  function mountMobileShell() {
+    if (!isNarrowScreen()) return;
+    if (document.getElementById("riff-mobile-bar")) return;
+
+    const style = document.createElement("style");
+    style.id = "riff-mobile-css";
+    style.textContent = [
+      "#riff-mobile-bar{position:fixed;top:0;left:0;right:0;height:56px;z-index:2147483645;display:flex;align-items:center;gap:8px;padding:0 10px;background:rgba(18,18,22,.97);border-bottom:1px solid rgba(255,255,255,.08)}",
+      "#riff-mobile-bar input{flex:1;min-width:0;height:38px;padding:0 12px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:#22242c;color:#eceef2;font:500 15px system-ui,sans-serif;outline:none}",
+      "#riff-mobile-bar input:focus{border-color:rgba(255,255,255,.32)}",
+      "#riff-mobile-bar button{flex:0 0 auto;height:38px;min-width:38px;padding:0 10px;border-radius:10px;border:0;background:#333847;color:#eceef2;font:600 15px/1 system-ui,sans-serif}",
+      "#riff-mobile-now{position:fixed;left:0;right:0;bottom:0;z-index:2147483645;display:none;align-items:center;gap:10px;padding:14px 14px calc(14px + env(safe-area-inset-bottom));background:rgba(28,29,36,.98);border-top:1px solid rgba(255,255,255,.1)}",
+      "#riff-mobile-now .riff-mn-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#eceef2;font:500 13px system-ui,sans-serif}",
+      "#riff-mobile-now button{flex:0 0 auto;width:34px;height:34px;border-radius:8px;border:0;background:#3d4353;color:#eceef2;font:600 15px system-ui,sans-serif}",
+      "body.mini .titlebar,body.mini .titlebar-controls{display:none!important}",
+      "#riff-mobile-empty{position:fixed;top:56px;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;z-index:2147483644}",
+      "#riff-mobile-empty p{margin:0;color:#8b909b;font:500 14px/1.5 system-ui,sans-serif;max-width:260px}",
+      "#riff-mobile-empty .riff-mchips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:300px}",
+      "#riff-mobile-empty .riff-mchips button{padding:9px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.16);background:#22242c;color:#dfe2e8;font:500 13px system-ui,sans-serif}",
+      "#riff-web-add{display:none!important}",
+      "#riff-web-note{left:8px!important;right:8px!important;bottom:76px!important;max-width:none!important;font-size:13px!important}",
+      "body.mini .playbar{display:none!important}",
+      "#riff-web-search{top:56px!important;left:0!important;right:0!important;bottom:0!important;transform:none!important;width:100%!important;max-height:none!important;border-radius:0!important;border:0!important}",
+    ].join("\n");
+    document.head.appendChild(style);
+
+    const bar = document.createElement("div");
+    bar.id = "riff-mobile-bar";
+    const input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "Search songs, artists";
+    input.autocomplete = "off";
+    input.setAttribute("enterkeyhint", "search");
+    input.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const q = (input.value || "").trim();
+      if (!q) return;
+      input.blur();
+      searchLibrary(q);
+    });
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "+";
+    add.title = "Add music";
+    add.addEventListener("click", () => {
+      const real = document.getElementById("riff-web-add");
+      if (real) real.click();
+    });
+    bar.append(input, add);
+    document.body.appendChild(bar);
+
+    const now = document.createElement("div");
+    now.id = "riff-mobile-now";
+    const label = document.createElement("span");
+    label.className = "riff-mn-text";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "riff-mn-toggle";
+    toggle.textContent = "\u2016";
+    toggle.addEventListener("click", () => {
+      const remote = window.__riffRemoteAudio;
+      const local = document.querySelector("audio");
+      const remoteLive = remote && remote.src && !remote.paused;
+      const target = remoteLive ? remote : local && local.currentTime > 0 ? local : remote || local;
+      if (!target) return;
+      if (target.paused) {
+        if (local && target === remote) { try { local.pause(); } catch {} }
+        target.play().catch(() => {});
+        toggle.textContent = "\u2016";
+      } else {
+        target.pause();
+        toggle.textContent = "\u25B6";
+      }
+    });
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "\u00D7";
+    stop.title = "Stop";
+    stop.addEventListener("click", () => {
+      const a = window.__riffRemoteAudio;
+      if (a) { a.pause(); a.removeAttribute("src"); }
+      hideMobileNow();
+    });
+    now.append(label, toggle, stop);
+    document.body.appendChild(now);
+
+    const empty = document.createElement("div");
+    empty.id = "riff-mobile-empty";
+    const hint = document.createElement("p");
+    hint.textContent = "Search for a song to play it in full. Try one of these:";
+    const chips = document.createElement("div");
+    chips.className = "riff-mchips";
+    for (const term of ["lofi", "jazz", "classical", "hip hop", "grateful dead"]) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.textContent = term;
+      chip.addEventListener("click", () => {
+        input.value = term;
+        input.blur();
+        searchLibrary(term);
+      });
+      chips.appendChild(chip);
+    }
+    empty.append(hint, chips);
+    document.body.appendChild(empty);
+
+    // keep riff's compact class in sync when the device rotates
+    window.addEventListener("resize", () => {
+      if (!isNarrowScreen()) {
+        bar.remove(); now.remove(); style.remove(); hideMobileNow();
+      } else if (!document.getElementById("riff-mobile-bar")) {
+        mountMobileShell();
+      }
+    });
+  }
+
   function mountHooks() {
     mountAddButton();
+    mountMobileShell();
     // the search field can arrive after DOMContentLoaded on the hosted build
     if (wireSearchBox()) return;
     const timer = setInterval(() => {
