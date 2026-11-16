@@ -505,6 +505,22 @@
     return checked.filter(Boolean);
   }
 
+  // Audius: free public catalog, no key, full-length streams that a media element can play
+  const AUDIUS = "https://api.audius.co/v1";
+  const AUDIUS_APP = "riff";
+
+  async function audiusSearch(query) {
+    const url = `${AUDIUS}/tracks/search?query=${encodeURIComponent(query)}&limit=10&app_name=${AUDIUS_APP}`;
+    const data = await withTimeout(async (signal) => {
+      const res = await fetch(url, { signal });
+      if (!res.ok) throw new Error(`Audius returned ${res.status}`);
+      return res.json();
+    }, 9000);
+    return ((data && data.data) || []).filter((t) => t && t.id && t.is_streamable !== false);
+  }
+
+  const audiusStreamUrl = (id) => `${AUDIUS}/tracks/${encodeURIComponent(id)}/stream?app_name=${AUDIUS_APP}`;
+
   const archiveUrlCache = new Map();
   async function archiveAudioUrl(identifier) {
     if (archiveUrlCache.has(identifier)) return archiveUrlCache.get(identifier);
@@ -669,11 +685,16 @@
     const addonHost = (() => { try { return new URL(addonBase()).host; } catch { return addonBase(); } })();
     let addonNote = null;
 
-    const [archive, apple, addon] = await Promise.all([
+    let audiusNote = null;
+    const [archive, apple, addon, audius] = await Promise.all([
       archiveSearch(query),
       itunesSearch(query),
       addonSearch(query).catch((e) => {
         addonNote = `OpenTune add-on (${addonHost}): ${e && e.message ? e.message : "unavailable"}`;
+        return [];
+      }),
+      audiusSearch(query).catch((e) => {
+        audiusNote = `Audius: ${e && e.message ? e.message : "unavailable"}`;
         return [];
       }),
     ]);
@@ -686,6 +707,18 @@
       onPlay: async () => {
         const ok = await playFirstPlayable(a.urls || []);
         if (!ok) throw new Error("no playable file");
+      },
+      closeOnPlay: false,
+    }));
+
+    const audiusItems = (audius || []).slice(0, 8).map((t) => ({
+      title: t.title || "Untitled",
+      artist: (t.user && t.user.name) || "Audius",
+      time: t.duration ? fmtTime(t.duration) : "full",
+      art: t.artwork && t.artwork["150x150"] ? t.artwork["150x150"] : "",
+      onPlay: async () => {
+        const ok = await playFirstPlayable([audiusStreamUrl(t.id)]);
+        if (!ok) throw new Error("Audius stream did not start");
       },
       closeOnPlay: false,
     }));
@@ -721,6 +754,7 @@
       [
         { label: `Your files (${rows.length})`, items: localItems },
         { label: "Full tracks · Internet Archive", items: archiveItems },
+        { label: "Full tracks · Audius", items: audiusItems, note: audiusNote },
         {
           label: `OpenTune add-on · ${addonHost}`,
           items: addonItems,
@@ -736,7 +770,7 @@
       ],
       null,
     );
-    return localItems.length + archiveItems.length + addonItems.length + appleItems.length;
+    return localItems.length + archiveItems.length + audiusItems.length + addonItems.length + appleItems.length;
   }
 
   let noteTimer = null;
