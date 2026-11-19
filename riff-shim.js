@@ -193,7 +193,8 @@
       const q = String(params.get("q") || "").trim();
       const limit = Math.max(1, parseInt(params.get("limit") || "12", 10));
       const offset = Math.max(0, parseInt(params.get("offset") || "0", 10));
-      const all = q ? await catalogSearch(q) : await catalogSearch("");
+      // ask for one row past the page so hasMore stays honest at the edges
+      const all = await catalogSearch(q, offset + limit + 1);
       const tracks = all.slice(offset, offset + limit);
       return json({ success: true, tracks, hasMore: offset + tracks.length < all.length });
     }
@@ -543,12 +544,13 @@
   // Internet Archive: full length audio, CORS open, no key needed. One archive
   // "item" is usually a whole album or concert, so list the songs inside it
   // instead of collapsing the record into a single row.
-  async function archiveSearch(query) {
+  async function archiveSearch(query, size = 12) {
     const term = String(query || "").replace(/"/g, "").trim();
+    const rows = Math.max(12, Math.min(48, Math.round(Number(size) || 12)));
     const q = encodeURIComponent(
       `mediatype:(audio) AND (title:("${term}") OR creator:("${term}") OR subject:("${term}") OR description:("${term}"))`,
     );
-    const url = `https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&rows=12&page=1&output=json`;
+    const url = `https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&rows=${rows}&page=1&output=json`;
     let docs = [];
     try {
       docs = await withTimeout(async (signal) => {
@@ -572,7 +574,7 @@
 
     // only offer files the browser can actually decode and play
     const checked = await Promise.all(
-      docs.slice(0, 12).map(async (d) => {
+      docs.slice(0, rows).map(async (d) => {
         if (!d || !d.identifier) return [];
         try {
           const meta = await withTimeout(async (signal) => {
@@ -618,21 +620,106 @@
         }
       }),
     );
-    return checked.flat().slice(0, 24);
+    return checked.flat().slice(0, rows * 2);
   }
 
   // Audius: free public catalog, no key, full-length streams that a media element can play
   const AUDIUS = "https://api.audius.co/v1";
   const AUDIUS_APP = "riff";
 
-  async function audiusSearch(query) {
-    const url = `${AUDIUS}/tracks/search?query=${encodeURIComponent(query)}&limit=25&app_name=${AUDIUS_APP}`;
+  async function audiusTrackSearch(query, limit = 25) {
+    const url = `${AUDIUS}/tracks/search?query=${encodeURIComponent(query)}&limit=${Math.max(1, Math.min(100, limit))}&app_name=${AUDIUS_APP}`;
     const data = await withTimeout(async (signal) => {
       const res = await fetch(url, { signal });
       if (!res.ok) throw new Error(`Audius returned ${res.status}`);
       return res.json();
     }, 9000);
     return ((data && data.data) || []).filter((t) => t && t.id && t.is_streamable !== false);
+  }
+
+  // Audius track search matches titles only, so an artist name stops after about ten
+  // songs. When the query names an artist, read their profile's whole catalogue instead.
+  const audiusArtistCache = new Map();
+  const audiusName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const AUDIUS_SUFFIX = /\s+(official|music|beats|band|real|the|hq|dj)$/;
+
+  async function audiusArtistTracks(query) {
+    const key = audiusName(query);
+    const words = key.split(" ").filter(Boolean);
+    if (!words.length || words.length > 4) return [];
+    const cached = audiusArtistCache.get(key);
+    if (cached && Date.now() - cached.at < 600000) return cached.tracks;
+
+    let users = [];
+    try {
+      const data = await withTimeout(async (signal) => {
+        const res = await fetch(`${AUDIUS}/users/search?query=${encodeURIComponent(query)}&limit=10&app_name=${AUDIUS_APP}`, { signal });
+        if (!res.ok) throw new Error(`Audius artist search returned ${res.status}`);
+        return res.json();
+      }, 6000);
+      users = (data && data.data) || [];
+    } catch {
+      return [];
+    }
+
+    const flat = key.replace(/\s+/g, "");
+    // the account has to actually be named that artist, otherwise every search would
+    // pull in whatever unrelated profile the loose user search happens to rank first
+    const match = users
+      .filter((u) => u && u.id && !u.is_deactivated && Number(u.track_count) > 1)
+      .filter((u) => {
+        const name = audiusName(u.name);
+        const handle = audiusName(u.handle).replace(/\s+/g, "");
+        return (
+          name === key ||
+          name.replace(AUDIUS_SUFFIX, "") === key ||
+          name.replace(/\s+/g, "") === flat ||
+          handle === flat
+        );
+      })
+      .sort((a, b) => Number(b.track_count) - Number(a.track_count))[0];
+    if (!match) {
+      audiusArtistCache.set(key, { at: Date.now(), tracks: [] });
+      return [];
+    }
+
+    const tracks = [];
+    try {
+      // the profile endpoint pages properly, unlike track search
+      for (let page = 0; page < 2; page++) {
+        const data = await withTimeout(async (signal) => {
+          const res = await fetch(`${AUDIUS}/users/${encodeURIComponent(match.id)}/tracks?limit=50&offset=${page * 50}&app_name=${AUDIUS_APP}`, { signal });
+          if (!res.ok) throw new Error(`Audius artist tracks returned ${res.status}`);
+          return res.json();
+        }, 9000);
+        const list = (data && data.data) || [];
+        for (const t of list) {
+          if (!t || !t.id) continue;
+          if (!t.user) t.user = { name: match.name, handle: match.handle };
+          tracks.push(t);
+        }
+        if (list.length < 50) break;
+      }
+    } catch {
+      // keep whatever arrived before the failure rather than dropping the artist
+    }
+    audiusArtistCache.set(key, { at: Date.now(), tracks });
+    return tracks;
+  }
+
+  async function audiusSearch(query, limit = 25) {
+    const [artist, found] = await Promise.all([
+      audiusArtistTracks(query).catch(() => []),
+      audiusTrackSearch(query, limit),
+    ]);
+    const out = [];
+    const seen = new Set();
+    for (const t of [...(artist || []), ...(found || [])]) {
+      if (!t || !t.id || t.is_streamable === false || seen.has(t.id)) continue;
+      seen.add(t.id);
+      out.push(t);
+    }
+    return out;
   }
 
   const audiusStreamUrl = (id) => `${AUDIUS}/tracks/${encodeURIComponent(id)}/stream?app_name=${AUDIUS_APP}`;
@@ -714,15 +801,25 @@
   const NOT_MUSIC = /\b(interview|podcast|audiobook|librivox|sermon|lecture|episode|commentary|newscast|speech|radio\s+show|dj\s+set|bootleg)\b/i;
 
   // One merged catalogue for riff's own search: full-length sources first, previews last.
+  // riff pages through it 12 rows at a time, so each query keeps an append-only merged
+  // list: a deeper page pulls bigger source lists and only adds tracks nobody has seen.
   const catalogCache = new Map();
-  async function catalogSearch(query) {
-    const key = String(query || "").trim().toLowerCase();
-    const hit = catalogCache.get(key);
-    if (hit && Date.now() - hit.at < 120000) return hit.tracks;
+  const CATALOG_STEPS = [12, 36, 84];
 
+  const pushTrack = (state, t) => {
+    const title = String((t && t.title) || "").trim();
+    if (!title) return false;
+    const dk = `${title.toLowerCase()}::${String(t.artist || "").trim().toLowerCase()}`;
+    if (state.seen.has(dk)) return false;
+    state.seen.add(dk);
+    state.tracks.push(t);
+    return true;
+  };
+
+  async function loadSources(query, key, size) {
     const [archive, audius, jamendo, apple, rows] = await Promise.all([
-      key ? settle(archiveSearch(query), 7000, []) : Promise.resolve([]),
-      key ? settle(audiusSearch(query), 7000, []) : Promise.resolve([]),
+      key ? settle(archiveSearch(query, size), 7000, []) : Promise.resolve([]),
+      key ? settle(audiusSearch(query, Math.min(100, Math.max(25, size * 2))), 7000, []) : Promise.resolve([]),
       key ? settle(openverseSearch(query), 7000, []) : Promise.resolve([]),
       key ? settle(itunesSearch(query), 7000, []) : Promise.resolve([]),
       settle(allFiles(), 2500, []),
@@ -739,17 +836,6 @@
         duration: Number(r.duration) || 0,
         thumbnail: "",
       }));
-
-    const tracks = [];
-    const seen = new Set();
-    const push = (t) => {
-      const title = String(t.title || "").trim();
-      if (!title) return;
-      const dk = `${title.toLowerCase()}::${String(t.artist || "").trim().toLowerCase()}`;
-      if (seen.has(dk)) return;
-      seen.add(dk);
-      tracks.push(t);
-    };
 
     const jamendoTracks = (jamendo || [])
       .filter((t) => !NOT_MUSIC.test(t.title || "") && !NOT_MUSIC.test(t.artist || ""))
@@ -787,30 +873,73 @@
       url: (a.urls || [])[0] || "",
     }));
 
-    // your own files first, then take turns so a single source never fills the page
-    for (const l of local) push(l);
-    const feeds = [jamendoTracks.slice(0, 12), audiusTracks.slice(0, 12), archiveTracks.slice(0, 12)];
-    for (let round = 0; round < 12; round++) {
-      for (const feed of feeds) if (feed[round]) push(feed[round]);
+    const previews = (apple || []).map((a) => ({
+      id: a.id || `${a.title}-${a.artist}`.replace(/\s+/g, "_"),
+      platform: "itunes",
+      title: a.title,
+      artist: a.artist,
+      album: "Apple Music preview",
+      // the file is 30 seconds, so never claim the song's full length
+      duration: 30,
+      thumbnail: a.art,
+      url: a.preview,
+    }));
+
+    return { local, previews, feeds: [jamendoTracks, audiusTracks, archiveTracks] };
+  }
+
+  // take turns between sources so one of them never fills a whole page of results
+  function fillCatalog(state, target) {
+    let addedAny = false;
+    while (state.tracks.length < target) {
+      let added = false;
+      for (let i = 0; i < state.feeds.length; i++) {
+        const feed = state.feeds[i];
+        let j = state.cursor[i] || 0;
+        while (j < feed.length) {
+          const t = feed[j++];
+          if (pushTrack(state, t)) { added = true; break; }
+        }
+        state.cursor[i] = j;
+        if (state.tracks.length >= target) break;
+      }
+      if (!added) break;
+      addedAny = true;
+    }
+    return addedAny;
+  }
+
+  async function catalogSearch(query, need = 0) {
+    const key = String(query || "").trim().toLowerCase();
+    const target = Math.max(12, Math.min(240, Math.round(Number(need) || 12)));
+    let state = catalogCache.get(key);
+    if (state && Date.now() - state.at > 120000) state = null;
+    if (!state) {
+      state = { at: Date.now(), tracks: [], seen: new Set(), cursor: [0, 0, 0], feeds: [[], [], []], previews: [], previewCursor: 0, size: 0 };
+      catalogCache.set(key, state);
+      if (catalogCache.size > 40) catalogCache.delete(catalogCache.keys().next().value);
     }
 
-    for (const a of apple) {
-      push({
-        id: a.id || `${a.title}-${a.artist}`.replace(/\s+/g, "_"),
-        platform: "itunes",
-        title: a.title,
-        artist: a.artist,
-        album: "Apple Music preview",
-        // the file is 30 seconds, so never claim the song's full length
-        duration: 30,
-        thumbnail: a.art,
-        url: a.preview,
-      });
+    for (const size of CATALOG_STEPS) {
+      if (state.tracks.length >= target) break;
+      if (size <= state.size) continue;
+      const loaded = await loadSources(query, key, size);
+      state.size = size;
+      state.at = Date.now();
+      // your own files first, then the catalogue
+      for (const l of loaded.local) pushTrack(state, l);
+      // a retry that comes back shorter must never drop rows already on screen
+      state.feeds = state.feeds.map((feed, i) => ((loaded.feeds[i] || []).length >= feed.length ? loaded.feeds[i] : feed));
+      if (loaded.previews.length >= state.previews.length) state.previews = loaded.previews;
+      const grew = fillCatalog(state, target);
+      // only reach for 30 second previews once no full length source has anything left
+      if (!grew) {
+        while (state.tracks.length < target && state.previewCursor < state.previews.length) {
+          pushTrack(state, state.previews[state.previewCursor++]);
+        }
+      }
     }
-
-    catalogCache.set(key, { at: Date.now(), tracks });
-    if (catalogCache.size > 40) catalogCache.delete(catalogCache.keys().next().value);
-    return tracks;
+    return state.tracks;
   }
 
   function makeRow(item) {
