@@ -541,6 +541,21 @@
     }
   };
 
+  // the item lookup is the slow part of an archive search, and a deeper page asks
+  // for the same items again, so answer from here instead of refetching
+  const archiveMetaCache = new Map();
+  async function archiveMeta(identifier) {
+    const cached = archiveMetaCache.get(identifier);
+    if (cached && Date.now() - cached.at < 900000) return cached.meta;
+    const meta = await withTimeout(async (signal) => {
+      const res = await fetch(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, { signal });
+      return res.json();
+    }, 6000);
+    archiveMetaCache.set(identifier, { at: Date.now(), meta });
+    if (archiveMetaCache.size > 240) archiveMetaCache.delete(archiveMetaCache.keys().next().value);
+    return meta;
+  }
+
   // Internet Archive: full length audio, CORS open, no key needed. One archive
   // "item" is usually a whole album or concert, so list the songs inside it
   // instead of collapsing the record into a single row.
@@ -573,14 +588,10 @@
     };
 
     // only offer files the browser can actually decode and play
-    const checked = await Promise.all(
-      docs.slice(0, rows).map(async (d) => {
+    const itemRows = async (d) => {
         if (!d || !d.identifier) return [];
         try {
-          const meta = await withTimeout(async (signal) => {
-            const res = await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier)}`, { signal });
-            return res.json();
-          }, 4500);
+          const meta = await archiveMeta(d.identifier);
           // lending-library items keep their audio private, so nothing would ever play
           const md = meta.metadata || {};
           if (md["access-restricted-item"] === "true") return [];
@@ -618,8 +629,15 @@
         } catch {
           return [];
         }
-      }),
-    );
+    };
+
+    // archive.org throttles a burst of lookups, so read the items in small batches;
+    // deeper pages hit the cache and only pay for the items they add
+    const checked = [];
+    const docsToRead = docs.slice(0, rows);
+    for (let i = 0; i < docsToRead.length; i += 8) {
+      checked.push(...(await Promise.all(docsToRead.slice(i, i + 8).map(itemRows))));
+    }
     return checked.flat().slice(0, rows * 2);
   }
 
@@ -648,7 +666,7 @@
     const words = key.split(" ").filter(Boolean);
     if (!words.length || words.length > 4) return [];
     const cached = audiusArtistCache.get(key);
-    if (cached && Date.now() - cached.at < 600000) return cached.tracks;
+    if (cached && Date.now() - cached.at < cached.ttl) return cached.tracks;
 
     let users = [];
     try {
@@ -679,11 +697,12 @@
       })
       .sort((a, b) => Number(b.track_count) - Number(a.track_count))[0];
     if (!match) {
-      audiusArtistCache.set(key, { at: Date.now(), tracks: [] });
+      audiusArtistCache.set(key, { at: Date.now(), tracks: [], ttl: 600000 });
       return [];
     }
 
     const tracks = [];
+    let complete = true;
     try {
       // the profile endpoint pages properly, unlike track search
       for (let page = 0; page < 2; page++) {
@@ -701,9 +720,11 @@
         if (list.length < 50) break;
       }
     } catch {
-      // keep whatever arrived before the failure rather than dropping the artist
+      // keep whatever arrived before the failure, but only briefly: a half read
+      // catalogue must not stick for the whole cache window
+      complete = false;
     }
-    audiusArtistCache.set(key, { at: Date.now(), tracks });
+    audiusArtistCache.set(key, { at: Date.now(), tracks, ttl: complete ? 600000 : 60000 });
     return tracks;
   }
 
@@ -818,7 +839,7 @@
 
   async function loadSources(query, key, size) {
     const [archive, audius, jamendo, apple, rows] = await Promise.all([
-      key ? settle(archiveSearch(query, size), 7000, []) : Promise.resolve([]),
+      key ? settle(archiveSearch(query, size), size > 12 ? 12000 : 7000, []) : Promise.resolve([]),
       key ? settle(audiusSearch(query, Math.min(100, Math.max(25, size * 2))), 7000, []) : Promise.resolve([]),
       key ? settle(openverseSearch(query), 7000, []) : Promise.resolve([]),
       key ? settle(itunesSearch(query), 7000, []) : Promise.resolve([]),
@@ -923,6 +944,7 @@
     for (const size of CATALOG_STEPS) {
       if (state.tracks.length >= target) break;
       if (size <= state.size) continue;
+      const before = state.feeds.map((feed) => feed.length);
       const loaded = await loadSources(query, key, size);
       state.size = size;
       state.at = Date.now();
@@ -932,11 +954,17 @@
       state.feeds = state.feeds.map((feed, i) => ((loaded.feeds[i] || []).length >= feed.length ? loaded.feeds[i] : feed));
       if (loaded.previews.length >= state.previews.length) state.previews = loaded.previews;
       const grew = fillCatalog(state, target);
+      const grewFeeds = state.feeds.some((feed, i) => feed.length > before[i]);
+      // nothing new and no bigger list to try: this size is the end of the road
+      if (!grew && !grewFeeds) break;
+    }
+
+    // once every source is loaded at full size, a deeper page just reads further
+    // down those lists instead of refetching them
+    if (state.tracks.length < target && !fillCatalog(state, target)) {
       // only reach for 30 second previews once no full length source has anything left
-      if (!grew) {
-        while (state.tracks.length < target && state.previewCursor < state.previews.length) {
-          pushTrack(state, state.previews[state.previewCursor++]);
-        }
+      while (state.tracks.length < target && state.previewCursor < state.previews.length) {
+        pushTrack(state, state.previews[state.previewCursor++]);
       }
     }
     return state.tracks;
