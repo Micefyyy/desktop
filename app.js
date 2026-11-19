@@ -5793,6 +5793,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         svg: '<svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#CC0FE0"/><path fill="#FFFFFF" d="M8 15.5V8.5l8 3.5-8 3.5z"/></svg>'
       };
     }
+    if (p === 'openverse') {
+      return {
+        id: 'openverse',
+        name: 'Jamendo (full track)',
+        svg: '<svg width="16" height="16" viewBox="0 0 24 24"><circle cx="12" cy="12" r="12" fill="#F4A261"/><path fill="#FFFFFF" d="M15.6 6.5 9.8 7.9v6.3a2.4 2.4 0 1 0 1.4 2.2V10l3-0.7v3.5a2.4 2.4 0 1 0 1.4 2.2V6.5z"/></svg>'
+      };
+    }
     if (p === 'itunes') {
       return {
         id: 'itunes',

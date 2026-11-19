@@ -576,13 +576,19 @@
           const urls = sorted
             .slice(0, 3)
             .map((f) => `https://archive.org/download/${encodeURIComponent(d.identifier)}/${String(f.name).split("/").map(encodeURIComponent).join("/")}`);
+          const title = Array.isArray(d.title) ? d.title[0] : d.title || d.identifier;
+          const artist = Array.isArray(d.creator) ? d.creator[0] : d.creator || "Internet Archive";
+          const seconds = Math.round(Number(sorted[0] && sorted[0].length) || 0);
+          // an interview, a podcast or a 20 second sting is not a song
+          if (NOT_MUSIC.test(String(title)) || NOT_MUSIC.test(String(artist))) return null;
+          if (!seconds || seconds < 60 || seconds > 1200) return null;
           return {
             identifier: d.identifier,
-            title: Array.isArray(d.title) ? d.title[0] : d.title || d.identifier,
-            artist: Array.isArray(d.creator) ? d.creator[0] : d.creator || "Internet Archive",
+            title,
+            artist,
             urls,
             thumb: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
-            duration: Math.round(Number(sorted[0] && sorted[0].length) || 0),
+            duration: seconds,
           };
         } catch {
           return null;
@@ -607,6 +613,41 @@
   }
 
   const audiusStreamUrl = (id) => `${AUDIUS}/tracks/${encodeURIComponent(id)}/stream?app_name=${AUDIUS_APP}`;
+
+  // Jamendo's catalogue is indexed by Openverse: no key, CORS open, and the files
+  // are the real masters (3-5 minutes), not a 30 second clip.
+  const OPENVERSE = "https://api.openverse.org/v1/audio/";
+
+  // Openverse points at prod-1.storage.jamendo.com, whose CDN caches whichever
+  // origin header it saw first, so a CORS audio element fails at random.
+  // mp3l.jamendo.com serves the same track with `Access-Control-Allow-Origin: *`.
+  function jamendoStreamUrl(raw) {
+    try {
+      const id = new URL(raw).searchParams.get("trackid");
+      return id ? `https://mp3l.jamendo.com/?trackid=${encodeURIComponent(id)}&format=mp32` : raw;
+    } catch {
+      return raw;
+    }
+  }
+
+  async function openverseSearch(query) {
+    const url = `${OPENVERSE}?q=${encodeURIComponent(query)}&source=jamendo&page_size=20`;
+    const data = await withTimeout(async (signal) => {
+      const res = await fetch(url, { signal });
+      if (!res.ok) throw new Error(res.status === 429 ? "too many searches, wait a minute" : `Openverse returned ${res.status}`);
+      return res.json();
+    }, 9000);
+    return ((data && data.results) || [])
+        .filter((r) => r && r.url && r.title && Number(r.duration) >= 60000)
+        .map((r) => ({
+          id: String(r.id || r.url),
+          title: String(r.title).replace(/\.(mp3|wav|ogg|m4a)$/i, "").trim(),
+          artist: r.creator || "Jamendo",
+          duration: Math.round(Number(r.duration) / 1000),
+          art: r.thumbnail || "",
+          url: jamendoStreamUrl(r.url),
+        }));
+  }
 
   const archiveUrlCache = new Map();
   async function archiveAudioUrl(identifier) {
@@ -645,6 +686,10 @@
     }
   }
 
+  // Internet Archive is full of interviews, podcasts and short clips that read like
+  // songs in search results, so keep the obvious non-music out.
+  const NOT_MUSIC = /\b(interview|podcast|audiobook|librivox|sermon|lecture|episode|commentary|newscast|speech|radio\s+show|dj\s+set|bootleg)\b/i;
+
   // One merged catalogue for riff's own search: full-length sources first, previews last.
   const catalogCache = new Map();
   async function catalogSearch(query) {
@@ -652,9 +697,10 @@
     const hit = catalogCache.get(key);
     if (hit && Date.now() - hit.at < 120000) return hit.tracks;
 
-    const [archive, audius, apple, rows] = await Promise.all([
+    const [archive, audius, jamendo, apple, rows] = await Promise.all([
       key ? settle(archiveSearch(query), 7000, []) : Promise.resolve([]),
       key ? settle(audiusSearch(query), 7000, []) : Promise.resolve([]),
+      key ? settle(openverseSearch(query), 7000, []) : Promise.resolve([]),
       key ? settle(itunesSearch(query), 7000, []) : Promise.resolve([]),
       settle(allFiles(), 2500, []),
     ]);
@@ -682,30 +728,49 @@
       tracks.push(t);
     };
 
-    for (const l of local) push(l);
-    for (const a of archive) {
-      push({
-        id: a.identifier,
-        platform: "archive",
-        title: a.title,
-        artist: a.artist,
-        album: "Internet Archive",
-        duration: Number(a.duration) || 0,
-        thumbnail: a.thumb || `https://archive.org/services/img/${encodeURIComponent(a.identifier)}`,
-        url: (a.urls || [])[0] || "",
-      });
-    }
-    for (const t of audius) {
-      push({
+    const jamendoTracks = (jamendo || [])
+      .filter((t) => !NOT_MUSIC.test(t.title || "") && !NOT_MUSIC.test(t.artist || ""))
+      .map((t) => ({
+        id: t.id,
+        platform: "openverse",
+        title: t.title,
+        artist: t.artist,
+        album: "Jamendo",
+        duration: Number(t.duration) || 0,
+        thumbnail: t.art || "",
+        url: t.url || "",
+      }));
+
+    const audiusTracks = (audius || [])
+      .filter((t) => !NOT_MUSIC.test(t.title || "") && !NOT_MUSIC.test((t.user && t.user.name) || ""))
+      .filter((t) => !Number(t.duration) || Number(t.duration) >= 60)
+      .map((t) => ({
         id: t.id,
         platform: "audius",
         title: t.title || "Untitled",
         artist: (t.user && t.user.name) || "Audius",
         duration: Number(t.duration) || 0,
-        thumbnail:
-          (t.artwork && (t.artwork["480x480"] || t.artwork["150x150"])) || "",
-      });
+        thumbnail: (t.artwork && (t.artwork["480x480"] || t.artwork["150x150"])) || "",
+      }));
+
+    const archiveTracks = (archive || []).map((a) => ({
+      id: a.identifier,
+      platform: "archive",
+      title: a.title,
+      artist: a.artist,
+      album: "Internet Archive",
+      duration: Number(a.duration) || 0,
+      thumbnail: a.thumb || `https://archive.org/services/img/${encodeURIComponent(a.identifier)}`,
+      url: (a.urls || [])[0] || "",
+    }));
+
+    // your own files first, then take turns so a single source never fills the page
+    for (const l of local) push(l);
+    const feeds = [jamendoTracks.slice(0, 8), audiusTracks.slice(0, 8), archiveTracks.slice(0, 8)];
+    for (let round = 0; round < 8; round++) {
+      for (const feed of feeds) if (feed[round]) push(feed[round]);
     }
+
     for (const a of apple) {
       push({
         id: a.id || `${a.title}-${a.artist}`.replace(/\s+/g, "_"),
@@ -868,9 +933,10 @@
     let addonNote = null;
 
     let audiusNote = null;
+    let jamendoNote = null;
     // only talk to an add-on when the user has actually configured one
     const addonConfigured = (() => { try { return Boolean(localStorage.getItem(ADDON_KEY)); } catch { return false; } })();
-    const [archive, apple, addon, audius] = await Promise.all([
+    const [archive, apple, addon, audius, jamendo] = await Promise.all([
       archiveSearch(query),
       itunesSearch(query),
       (addonConfigured
@@ -882,6 +948,10 @@
       }),
       audiusSearch(query).catch((e) => {
         audiusNote = `Audius: ${e && e.message ? e.message : "unavailable"}`;
+        return [];
+      }),
+      openverseSearch(query).catch((e) => {
+        jamendoNote = `Jamendo: ${e && e.message ? e.message : "unavailable"}`;
         return [];
       }),
     ]);
@@ -919,6 +989,23 @@
       closeOnPlay: false,
     }));
 
+    const jamendoItems = (jamendo || [])
+      .filter((t) => !NOT_MUSIC.test(t.title || "") && !NOT_MUSIC.test(t.artist || ""))
+      .slice(0, 8)
+      .map((t) => ({
+        title: t.title,
+        artist: t.artist,
+        time: t.duration ? fmtTime(t.duration) : "full",
+        art: t.art || "",
+        track: { type: "openverse", url: t.url, title: t.title, artist: t.artist, art: t.art, duration: t.duration },
+        onPlay: async () => {
+          const audio = playRemote(t.url);
+          const ok = await waitForPlayback(audio, 12000);
+          if (!ok) throw new Error("Jamendo stream did not start");
+        },
+        closeOnPlay: false,
+      }));
+
     const appleItems = apple.map((a) => ({
       title: a.title,
       artist: a.artist,
@@ -952,6 +1039,7 @@
         { label: `Your files (${rows.length})`, items: localItems },
         { label: "Full tracks · Internet Archive", items: archiveItems },
         { label: "Full tracks · Audius", items: audiusItems, note: audiusNote },
+        { label: "Full tracks · Jamendo", items: jamendoItems, note: jamendoNote },
         ...(addonConfigured ? [{
           label: `OpenTune add-on · ${addonHost}`,
           items: addonItems,
@@ -967,7 +1055,7 @@
       ],
       null,
     );
-    return localItems.length + archiveItems.length + audiusItems.length + addonItems.length + appleItems.length;
+    return localItems.length + archiveItems.length + audiusItems.length + jamendoItems.length + addonItems.length + appleItems.length;
   }
 
   let noteTimer = null;
@@ -1091,6 +1179,9 @@
     }
     if (t.type === "audius") {
       return { ...base, onPlay: async () => { if (!(await playFirstPlayable([audiusStreamUrl(t.id)]))) throw new Error("Audius stream did not start"); } };
+    }
+    if (t.type === "openverse") {
+      return { ...base, onPlay: async () => { const a = playRemote(t.url); if (!(await waitForPlayback(a, 12000))) throw new Error("Jamendo stream did not start"); } };
     }
     if (t.type === "apple") {
       return { ...base, onPlay: async () => { const a = playRemote(t.preview); if (!(await waitForPlayback(a, 12000))) throw new Error("preview did not start"); } };
