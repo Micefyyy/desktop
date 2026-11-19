@@ -540,12 +540,15 @@
     }
   };
 
-  // Internet Archive: full length audio, CORS open, no key needed
+  // Internet Archive: full length audio, CORS open, no key needed. One archive
+  // "item" is usually a whole album or concert, so list the songs inside it
+  // instead of collapsing the record into a single row.
   async function archiveSearch(query) {
+    const term = String(query || "").replace(/"/g, "").trim();
     const q = encodeURIComponent(
-      `mediatype:(audio) AND collection:(audio_music) AND (title:("${query}") OR creator:("${query}") OR subject:("${query}"))`,
+      `mediatype:(audio) AND (title:("${term}") OR creator:("${term}") OR subject:("${term}") OR description:("${term}"))`,
     );
-    const url = `https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&rows=8&page=1&output=json`;
+    const url = `https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&rows=12&page=1&output=json`;
     let docs = [];
     try {
       docs = await withTimeout(async (signal) => {
@@ -557,45 +560,65 @@
       return [];
     }
 
-    // only offer items that really contain a file the browser can decode
+    const fileUrl = (identifier, name) =>
+      `https://archive.org/download/${encodeURIComponent(identifier)}/${String(name).split("/").map(encodeURIComponent).join("/")}`;
+
+    const trackTitle = (f) => {
+      const named = String(f.title || "").trim();
+      if (named) return named;
+      const base = String(f.name || "").split("/").pop().replace(/\.[a-z0-9]+$/i, "");
+      return base.replace(/^\s*\d{1,3}[.\-_ ]\s*/, "").replace(/_/g, " ").trim();
+    };
+
+    // only offer files the browser can actually decode and play
     const checked = await Promise.all(
-      docs.slice(0, 8).map(async (d) => {
-        if (!d || !d.identifier) return null;
+      docs.slice(0, 12).map(async (d) => {
+        if (!d || !d.identifier) return [];
         try {
           const meta = await withTimeout(async (signal) => {
             const res = await fetch(`https://archive.org/metadata/${encodeURIComponent(d.identifier)}`, { signal });
             return res.json();
-          }, 4000);
+          }, 4500);
           // lending-library items keep their audio private, so nothing would ever play
           const md = meta.metadata || {};
-          if (md["access-restricted-item"] === "true") return null;
-          const files = (meta.files || []).filter((f) => f && f.private !== "true" && /.(mp3|wav)$/i.test(f.name || ""));
-          if (!files.length) return null;
-          const score = (f) => (/64kb/i.test(f.name) ? 0 : /.mp3$/i.test(f.name) ? 1 : 2);
-          const sorted = files.sort((a, b) => score(a) - score(b));
-          const urls = sorted
-            .slice(0, 3)
-            .map((f) => `https://archive.org/download/${encodeURIComponent(d.identifier)}/${String(f.name).split("/").map(encodeURIComponent).join("/")}`);
-          const title = Array.isArray(d.title) ? d.title[0] : d.title || d.identifier;
-          const artist = Array.isArray(d.creator) ? d.creator[0] : d.creator || "Internet Archive";
-          const seconds = Math.round(Number(sorted[0] && sorted[0].length) || 0);
-          // an interview, a podcast or a 20 second sting is not a song
-          if (NOT_MUSIC.test(String(title)) || NOT_MUSIC.test(String(artist))) return null;
-          if (!seconds || seconds < 60 || seconds > 1200) return null;
-          return {
-            identifier: d.identifier,
-            title,
-            artist,
-            urls,
-            thumb: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
-            duration: seconds,
-          };
+          if (md["access-restricted-item"] === "true") return [];
+          const itemTitle = Array.isArray(d.title) ? d.title[0] : d.title || d.identifier;
+          const itemArtist = Array.isArray(d.creator) ? d.creator[0] : d.creator || md.creator || "Internet Archive";
+          if (NOT_MUSIC.test(String(itemTitle)) || NOT_MUSIC.test(String(itemArtist))) return [];
+
+          const audio = (meta.files || []).filter((f) => f && f.private !== "true" && /\.(mp3|wav|ogg|m4a|flac)$/i.test(f.name || ""));
+          // one clean set only: real mp3s before 64kb derivatives, mp3 before anything else
+          const mp3s = audio.filter((f) => /\.mp3$/i.test(f.name));
+          const pool = mp3s.length ? mp3s : audio;
+          const hq = pool.filter((f) => !/64kb/i.test(f.name));
+          const files = (hq.length ? hq : pool).filter((f) => {
+            const s = Math.round(Number(f.length) || 0);
+            return !s || (s >= 45 && s <= 1800);
+          });
+          if (!files.length) return [];
+
+          const thumb = `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`;
+          return files
+            .slice(0, 15)
+            .map((f) => {
+              const title = trackTitle(f);
+              if (!title || NOT_MUSIC.test(title)) return null;
+              return {
+                identifier: d.identifier,
+                title,
+                artist: itemArtist,
+                urls: [fileUrl(d.identifier, f.name)],
+                thumb,
+                duration: Math.round(Number(f.length) || 0),
+              };
+            })
+            .filter(Boolean);
         } catch {
-          return null;
+          return [];
         }
       }),
     );
-    return checked.filter(Boolean);
+    return checked.flat().slice(0, 24);
   }
 
   // Audius: free public catalog, no key, full-length streams that a media element can play
@@ -603,7 +626,7 @@
   const AUDIUS_APP = "riff";
 
   async function audiusSearch(query) {
-    const url = `${AUDIUS}/tracks/search?query=${encodeURIComponent(query)}&limit=10&app_name=${AUDIUS_APP}`;
+    const url = `${AUDIUS}/tracks/search?query=${encodeURIComponent(query)}&limit=25&app_name=${AUDIUS_APP}`;
     const data = await withTimeout(async (signal) => {
       const res = await fetch(url, { signal });
       if (!res.ok) throw new Error(`Audius returned ${res.status}`);
@@ -766,8 +789,8 @@
 
     // your own files first, then take turns so a single source never fills the page
     for (const l of local) push(l);
-    const feeds = [jamendoTracks.slice(0, 8), audiusTracks.slice(0, 8), archiveTracks.slice(0, 8)];
-    for (let round = 0; round < 8; round++) {
+    const feeds = [jamendoTracks.slice(0, 12), audiusTracks.slice(0, 12), archiveTracks.slice(0, 12)];
+    for (let round = 0; round < 12; round++) {
       for (const feed of feeds) if (feed[round]) push(feed[round]);
     }
 
@@ -778,7 +801,8 @@
         title: a.title,
         artist: a.artist,
         album: "Apple Music preview",
-        duration: a.duration || 30,
+        // the file is 30 seconds, so never claim the song's full length
+        duration: 30,
         thumbnail: a.art,
         url: a.preview,
       });
@@ -956,7 +980,7 @@
       }),
     ]);
 
-    const archiveItems = archive.map((a) => ({
+    const archiveItems = archive.slice(0, 14).map((a) => ({
       title: a.title,
       artist: a.artist,
       time: a.duration ? fmtTime(a.duration) : "full",
